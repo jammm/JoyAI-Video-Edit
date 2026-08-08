@@ -599,15 +599,139 @@ class XVAEChunkCausal(ModelMixin, ConfigMixin):
         return x
 
     def clear_cache(self):
+        self._reset_encode_stream_cache()
+        self._reset_decode_stream_cache()
+
+    def _reset_encode_stream_cache(self):
         if not hasattr(self, "_enc_conv_num") or not hasattr(self, "_dec_conv_num"):
             self._enc_conv_num = sum(isinstance(m, ChunkCausalConv3d)
                                      for m in self.encoder.modules())
             self._dec_conv_num = sum(isinstance(m, ChunkCausalConv3d)
                                      for m in self.decoder.modules())
         self._enc_conv_idx = [0]
-        self._dec_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
+        self._encode_stream_started = False
+
+    def _reset_decode_stream_cache(self):
+        if not hasattr(self, "_enc_conv_num") or not hasattr(self, "_dec_conv_num"):
+            self._enc_conv_num = sum(isinstance(m, ChunkCausalConv3d)
+                                     for m in self.encoder.modules())
+            self._dec_conv_num = sum(isinstance(m, ChunkCausalConv3d)
+                                     for m in self.decoder.modules())
+        self._dec_conv_idx = [0]
         self._dec_feat_map = [None] * self._dec_conv_num
+        self._decode_stream_started = False
+
+    def reset_encode_stream(self):
+        self._reset_encode_stream_cache()
+
+    def reset_decode_stream(self):
+        self._reset_decode_stream_cache()
+
+    def _encode_stream(self, x: Tensor):
+        """Encode the next causal pixel chunk while retaining convolution state."""
+        first_chunk = not getattr(self, "_encode_stream_started", False)
+        valid_t = (
+            x.shape[2] == 1 if first_chunk
+            else 0 < x.shape[2] <= self.chunk_size and x.shape[2] % self.ffactor_temporal == 0
+        )
+        if not valid_t:
+            raise ValueError(
+                "streaming VAE encode expected a 1-frame prologue or a positive "
+                f"multiple of {self.ffactor_temporal} up to {self.chunk_size}; "
+                f"got {x.shape[2]}"
+            )
+        if first_chunk:
+            self._reset_encode_stream_cache()
+
+        compiled = getattr(
+            self,
+            "_encode_stream_first_compiled" if first_chunk else "_encode_stream_next_compiled",
+            None,
+        )
+        if compiled is not None:
+            result = (
+                compiled(x)
+                if first_chunk
+                else compiled(x, *self._enc_feat_map)
+            )
+            out, *feature_cache = result
+            self._enc_feat_map = feature_cache
+            self._encode_stream_started = True
+            return out
+
+        x = self.stem(x)
+        _, _, _, h, w = x.shape
+        if h % self.ffactor_spatial != 0 or w % self.ffactor_spatial != 0:
+            raise ValueError(
+                f"streaming VAE encode spatial shape {(h, w)} must be divisible "
+                f"by {self.ffactor_spatial}"
+            )
+        x = self.patchify(x, self.patch_size)
+        self._enc_conv_idx = [0]
+        out = self.encoder(
+            x,
+            feat_cache=self._enc_feat_map,
+            feat_idx=self._enc_conv_idx,
+            first_chunk=first_chunk,
+        )
+        self._encode_stream_started = True
+        return out
+
+    def encode_stream(self, x: Tensor, return_dict: bool = True):
+        if x.ndim != 5 or x.shape[0] != 1:
+            raise ValueError(f"streaming VAE encode expects [1,C,T,H,W], got {tuple(x.shape)}")
+        posterior = DiagonalGaussianDistribution(self._encode_stream(x))
+        if not return_dict:
+            return (posterior,)
+        return EncoderOutput(latent_dist=posterior)
+
+    def _decode_stream(self, z: Tensor):
+        """Decode the next causal latent chunk while retaining convolution state."""
+        first_chunk = not getattr(self, "_decode_stream_started", False)
+        latent_chunk_size = self.chunk_size // self.ffactor_temporal
+        if not (0 < z.shape[2] <= latent_chunk_size):
+            raise ValueError(
+                f"streaming VAE decode expected 1..{latent_chunk_size} latent frames, "
+                f"got {z.shape[2]}"
+            )
+        if first_chunk:
+            self._reset_decode_stream_cache()
+
+        compiled = getattr(
+            self,
+            "_decode_stream_first_compiled" if first_chunk else "_decode_stream_next_compiled",
+            None,
+        )
+        if compiled is not None:
+            result = (
+                compiled(z)
+                if first_chunk
+                else compiled(z, *self._dec_feat_map)
+            )
+            out, *feature_cache = result
+            self._dec_feat_map = feature_cache
+            self._decode_stream_started = True
+            return out
+
+        self._dec_conv_idx = [0]
+        out = self.decoder(
+            z,
+            feat_cache=self._dec_feat_map,
+            feat_idx=self._dec_conv_idx,
+            first_chunk=first_chunk,
+        )
+        self._decode_stream_started = True
+        out = self.unpatchify(out, self.patch_size)
+        return self.head(out)
+
+    def decode_stream(self, z: Tensor, return_dict: bool = True):
+        if z.ndim != 5 or z.shape[0] != 1:
+            raise ValueError(f"streaming VAE decode expects [1,C,T,H,W], got {tuple(z.shape)}")
+        decoded = self._decode_stream(z)
+        if not return_dict:
+            return (decoded,)
+        return DecoderOutput(sample=decoded)
 
     def _encode(self, x: Tensor):
         x = self.stem(x)

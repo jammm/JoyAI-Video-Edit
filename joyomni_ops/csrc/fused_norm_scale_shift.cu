@@ -8,7 +8,7 @@
  *
  * x:            [M, N]  (row-contiguous)
  * gamma/beta:   None or [N]   (affine; beta only for LayerNorm)
- * scale/shift:  [M, N]  (per row) — one modulation vector per token row
+ * scale/shift:  [M, N] (per row), or [1, N] broadcast over all token rows
  * norm_type:    0 = LayerNorm, 1 = RMSNorm
  */
 #include <ATen/cuda/CUDAContext.h>
@@ -26,15 +26,42 @@ enum NormType : int { kLayerNorm = 0, kRMSNorm = 1 };
 
 template <typename T, int NumVals>
 __device__ __forceinline__ void warpReduceSum(T (&vals)[NumVals]) {
+#if defined(__HIP_PLATFORM_AMD__)
+#pragma unroll
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+#pragma unroll
+    for (int i = 0; i < NumVals; ++i) vals[i] += __shfl_down(vals[i], offset);
+#else
   unsigned mask = 0xffffffffu;
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1)
 #pragma unroll
     for (int i = 0; i < NumVals; ++i) vals[i] += __shfl_down_sync(mask, vals[i], offset);
+#endif
 }
 
 template <typename T, int NumVals>
 __device__ __forceinline__ void blockReduceSum(T (&vals)[NumVals]) {
+#if defined(__HIP_PLATFORM_AMD__)
+  // Hierarchical wave64 reduction: one partial per wave, followed by a single
+  // wave reducing at most 16 partials.  The caller only consumes vals on
+  // thread 0 and publishes it through its own shared scalar/barrier.
+  __shared__ T shared[16][NumVals];
+  const int lane = threadIdx.x % warpSize;
+  const int wid = threadIdx.x / warpSize;
+  warpReduceSum<T, NumVals>(vals);
+  if (lane == 0)
+#pragma unroll
+    for (int i = 0; i < NumVals; ++i) shared[wid][i] = vals[i];
+  __syncthreads();
+  if (wid == 0) {
+    const int num_waves = (blockDim.x + warpSize - 1) / warpSize;
+#pragma unroll
+    for (int i = 0; i < NumVals; ++i)
+      vals[i] = lane < num_waves ? shared[lane][i] : T(0);
+    warpReduceSum<T, NumVals>(vals);
+  }
+#else
   __shared__ T shared[32][NumVals];
   int lane = threadIdx.x & 31;
   int wid = threadIdx.x >> 5;
@@ -57,6 +84,7 @@ __device__ __forceinline__ void blockReduceSum(T (&vals)[NumVals]) {
     for (int i = 0; i < NumVals; ++i) vals[i] = acc[i];
   }
   __syncthreads();
+#endif
 }
 
 // Vec-of-4 element types.
@@ -66,11 +94,12 @@ struct alignas(8) half4 { __half x, y, z, w; };
 template <typename T4_, typename T_>
 struct DTypeTag { using T4 = T4_; using T = T_; };
 
-// One block per row (m_idx). scale/shift indexed per-row [M, N].
+// One block per row (m_idx). scale/shift are per-row [M, N] or broadcast [1, N].
 template <typename T4, typename T, int ITEM_PER_THREAD, int norm_type>
 __global__ void normScaleShiftPerRow(
     T4* output, const T4* input, const T4* gamma, const T4* beta,
-    const T4* scale, const T4* shift, const int n, bool affine, float eps) {
+    const T4* scale, const T4* shift, const int n, bool affine,
+    bool broadcast_modulation, float eps) {
   const int m_idx = blockIdx.x;
   const int tid = threadIdx.x;
   const int bdimx = blockDim.x;
@@ -81,8 +110,10 @@ __global__ void normScaleShiftPerRow(
   const int offset = m_idx * n_4;
   input += offset;
   output += offset;
-  scale += offset;  // per-row
-  shift += offset;
+  if (!broadcast_modulation) {
+    scale += offset;
+    shift += offset;
+  }
 
   const T4 zero = {T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
 #pragma unroll
@@ -96,8 +127,12 @@ __global__ void normScaleShiftPerRow(
                        float(local_val[i].z) * float(local_val[i].z) + float(local_val[i].w) * float(local_val[i].w);
     }
   }
+#if defined(__HIP_PLATFORM_AMD__)
+  blockReduceSum<float, 1>(local_sums);
+#else
   if (blockDim.x <= 32) warpReduceSum<float, 1>(local_sums);
   else blockReduceSum<float, 1>(local_sums);
+#endif
   if (tid == 0) s_mean = local_sums[0] / n;
   __syncthreads();
 
@@ -112,8 +147,12 @@ __global__ void normScaleShiftPerRow(
         local_sums[0] += t.x * t.x + t.y * t.y + t.z * t.z + t.w * t.w;
       }
     }
+#if defined(__HIP_PLATFORM_AMD__)
+    blockReduceSum<float, 1>(local_sums);
+#else
     if (blockDim.x <= 32) warpReduceSum<float, 1>(local_sums);
     else blockReduceSum<float, 1>(local_sums);
+#endif
   }
   if (tid == 0) s_variance = rsqrtf(local_sums[0] / n + eps);  // rms: rsqrt(mean(x^2)+eps)
   __syncthreads();
@@ -151,17 +190,42 @@ void launch(const torch::Tensor& x, void* gamma_ptr, void* beta_ptr, const torch
   dim3 grid((unsigned)M);
   dim3 block;
   auto stream = at::cuda::getCurrentCUDAStream();
+  const bool broadcast_modulation = scale.size(0) == 1;
 #define LAUNCH(IPT, NT)                                                                        \
   normScaleShiftPerRow<T4, T, IPT, NT><<<grid, block, 0, stream>>>(                            \
       (T4*)y.data_ptr(), (const T4*)x.data_ptr(), (const T4*)gamma_ptr, (const T4*)beta_ptr,   \
-      (const T4*)scale.data_ptr(), (const T4*)shift.data_ptr(), (int)N, affine, eps)
+      (const T4*)scale.data_ptr(), (const T4*)shift.data_ptr(), (int)N, affine,                \
+      broadcast_modulation, eps)
   if (N <= 4096) {
+#if defined(__HIP_PLATFORM_AMD__)
+    // Keep four waves per block and raise the vector count per lane.  This is
+    // materially faster than a 1024-thread/one-vector block on gfx950 while
+    // preserving coalesced vector loads and stores.
+    block.x = 256;
+#else
     block.x = (unsigned)((N / 4 + 31) / 32 * 32);
     if (block.x > 1024) block.x = 1024;
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+    if (N <= 1024) {
+      if (norm_type == kLayerNorm) { LAUNCH(1, kLayerNorm); } else { LAUNCH(1, kRMSNorm); }
+    } else if (N <= 2048) {
+      if (norm_type == kLayerNorm) { LAUNCH(2, kLayerNorm); } else { LAUNCH(2, kRMSNorm); }
+    } else {
+      if (norm_type == kLayerNorm) { LAUNCH(4, kLayerNorm); } else { LAUNCH(4, kRMSNorm); }
+    }
+#else
     if (norm_type == kLayerNorm) { LAUNCH(1, kLayerNorm); } else { LAUNCH(1, kRMSNorm); }
+#endif
   } else {
+#if defined(__HIP_PLATFORM_AMD__)
+    const unsigned needed = (unsigned)((N / 4 + 7) / 8);
+    block.x = 64;
+    while (block.x < needed && block.x < 1024) block.x <<= 1;
+#else
     block.x = (unsigned)(((N + 7) / 8 + 31) / 32 * 32);
     if (block.x > 1024) block.x = 1024;
+#endif
     if (norm_type == kLayerNorm) { LAUNCH(8, kLayerNorm); } else { LAUNCH(8, kRMSNorm); }
   }
 #undef LAUNCH
@@ -180,8 +244,10 @@ torch::Tensor fused_norm_scale_shift(
   TORCH_CHECK(x.stride(-1) == 1, "x last dim must be contiguous");
   const int64_t M = x.size(0), N = x.size(1);
   TORCH_CHECK((N % 4) == 0, "N must be divisible by 4");
-  TORCH_CHECK(scale.dim() == 2 && shift.dim() == 2, "scale/shift must be 2D [M, N]");
-  TORCH_CHECK(scale.size(0) == M && shift.size(0) == M, "scale/shift rows must equal M (per-row modulation)");
+  TORCH_CHECK(scale.dim() == 2 && shift.dim() == 2, "scale/shift must be 2D [M, N] or [1, N]");
+  TORCH_CHECK(scale.size(0) == shift.size(0), "scale/shift row counts must match");
+  TORCH_CHECK(scale.size(0) == 1 || scale.size(0) == M,
+              "scale/shift rows must be 1 (broadcast) or M (per-row modulation)");
   TORCH_CHECK(scale.size(1) == N && shift.size(1) == N, "scale/shift last dim must be N");
   TORCH_CHECK(scale.stride(-1) == 1 && shift.stride(-1) == 1, "scale/shift last dim must be contiguous");
   TORCH_CHECK(x.dtype() == scale.dtype() && x.dtype() == shift.dtype(), "x/scale/shift dtype must match");

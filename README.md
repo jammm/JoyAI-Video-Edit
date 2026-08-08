@@ -99,6 +99,14 @@ conda activate joyai-video-edit
 python -m pip install -r requirements.txt
 ```
 
+`requirements.txt` targets NVIDIA CUDA. For AMD ROCm, activate a compatible
+ROCm PyTorch environment, install `requirements-rocm.txt`, and build the gfx950
+kernels as described in [`DEPLOYMENT.md`](DEPLOYMENT.md#amd-rocm--gfx950).
+The tested MI350X live preset uses two denoising steps at 1248x720 and a
+hybrid 18-layer clean-KV refresh; see
+[`HANDOFF.md`](HANDOFF.md) for the exact TheRock setup, launch, benchmark, and
+rocprof commands.
+
 ### 2. Prepare Checkpoints
 
 Download the released weights from the Hugging Face link above. MiMo-VL and the ONNX detector files are external runtime dependencies; see [`DEPLOYMENT.md`](DEPLOYMENT.md) for deployment details.
@@ -116,11 +124,14 @@ Then open:
 http://localhost:8080
 ```
 
-For remote machines, bind the server to `0.0.0.0` and open the selected port, or use SSH port forwarding.
+For remote machines, bind the server to `0.0.0.0`. Browser camera capture
+requires a trusted HTTPS/WSS origin, so use client-resolvable DNS with a trusted
+TLS reverse proxy or access it as localhost through SSH forwarding; a plain
+remote HTTP URL can display the UI but cannot obtain camera permission.
 
 ## 🛠️ Custom Deployment
 
-For custom deployment, edit `deploy/run_server.sh` to set checkpoint paths, CUDA device placement, host, and port. The default script also sets persistent TorchInductor, Triton, and CUDA cache directories so compile artifacts are reused across launches.
+For custom deployment, edit `deploy/run_server.sh` to set checkpoint paths, accelerator device placement, host, and port. The default script also sets persistent TorchInductor, Triton, and GPU compile-cache directories so compile artifacts are reused across launches.
 
 `TORCHINDUCTOR_AUTOGRAD_CACHE` is not required for inference-only serving.
 

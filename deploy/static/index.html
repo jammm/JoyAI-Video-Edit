@@ -275,8 +275,8 @@
   <input id="steps" type="number" value="2" min="1" max="8" />
   <label><input id="smoothPlayback" type="checkbox" checked /> <span data-i18n="smooth_playback">平滑输出播放</span></label>
   <div id="playbackDelayWrap" class="row">
-    <div><input id="targetQueueDelayMs" type="number" value="500" min="0" max="5000" step="50" /></div>
-    <div><input id="maxQueueDelayMs" type="number" value="650" min="0" max="8000" step="50" /></div>
+    <div><input id="targetQueueDelayMs" type="number" value="1000" min="0" max="5000" step="50" /></div>
+    <div><input id="maxQueueDelayMs" type="number" value="1500" min="0" max="8000" step="50" /></div>
   </div>
   <input id="kvResetFrames" type="number" value="1080" min="0" step="1" />
   <label><input id="useMaxTemporalIds" type="checkbox" checked /> <span data-i18n="max_temporal">最大时序 ID</span></label>
@@ -583,9 +583,12 @@ let peCache = null;
 let pendingPeCacheKey = null;
 let outputPlaybackTimer = null;
 let outputPlaybackIntervalMs = null;
-const MAX_WS_BUFFERED_BYTES = 64 * 1024 * 1024;
-const DEFAULT_TARGET_OUTPUT_QUEUE_DELAY_MS = 500;
-const DEFAULT_MAX_OUTPUT_QUEUE_DELAY_MS = 650;
+let outputPlaybackPrimed = false;
+// Keep three model chunks buffered so their bursty wire delivery is rendered
+// as one continuous 24 fps stream across a high-jitter VPN.
+const MAX_WS_BUFFERED_BYTES = 512 * 1024;
+const DEFAULT_TARGET_OUTPUT_QUEUE_DELAY_MS = 1000;
+const DEFAULT_MAX_OUTPUT_QUEUE_DELAY_MS = 1500;
 function targetOutputQueueDelayMs() {
   const el = document.getElementById("targetQueueDelayMs");
   const raw = el && el.value !== "" ? el.value : null;
@@ -599,6 +602,8 @@ function maxOutputQueueDelayMs() {
   const v = raw === null ? NaN : Number(raw);
   return Number.isFinite(v) && v >= 0 ? v : DEFAULT_MAX_OUTPUT_QUEUE_DELAY_MS;
 }
+// One RTT can contain most of a second of 24 fps input on the Tokyo VPN. This
+// cap is still finite, but large enough to avoid starving an 8-frame window.
 const MAX_BACKEND_PENDING_FRAMES = 32;
 let sendBackpressureSkips = 0;
 let sendRealtimeSkips = 0;
@@ -608,7 +613,6 @@ let backendOutFrames = 0;
 let receivedFrames = 0;
 let displayedFrames = 0;
 let lastObjectUrl = null;
-let alignMaxAgeMs = 0;
 let lastShownCaptureMs = 0;
 let pendingRevokeUrl = null;
 let lastSourceObjectUrl = null;
@@ -655,6 +659,9 @@ async function probeUplinkH264() {
       width: w,
       height: h,
       latencyMode: "realtime",
+      bitrate: 2_500_000,
+      bitrateMode: "variable",
+      framerate: sendTargetFps(),
       avc: { format: "annexb" },
     });
     uplinkH264Supported = !!(support && support.supported);
@@ -675,7 +682,8 @@ function teardownUplinkEncoder() {
   uplinkPendingMeta = [];
 }
 
-function setupUplinkEncoder() {
+function setupUplinkEncoder(preserveTimeline = false) {
+  const resumeFrameIndex = preserveTimeline ? uplinkFrameIndex : 0;
   teardownUplinkEncoder();
   const w = Number(document.getElementById("width").value);
   const h = Number(document.getElementById("height").value);
@@ -703,13 +711,14 @@ function setupUplinkEncoder() {
     width: w,
     height: h,
     latencyMode: "realtime",
+    bitrate: 2_500_000,
     bitrateMode: "variable",
     framerate: sendTargetFps(),
     avc: { format: "annexb" },
   });
   uplinkEncoder = enc;
   uplinkForceKeyframe = true;
-  uplinkFrameIndex = 0;
+  uplinkFrameIndex = resumeFrameIndex;
   uplinkPendingMeta = [];
 }
 
@@ -722,16 +731,20 @@ let downlinkSawKey = false;
 let downlinkPendingMeta = [];
 
 // --- downlink h264 diagnostics (on-screen HUD) ---
-const DL_BUILD = "dl-hud-1";
-let dlStat = { recv: 0, dropWait: 0, decodeCalls: 0, decodeThrow: 0, output: 0, bitmap: 0, bitmapErr: 0, draw: 0, lastErr: "" };
+const DL_BUILD = "dl-hud-4-adaptive-playback";
+let dlStat = { recv: 0, dropWait: 0, restart: 0, decodeCalls: 0, decodeThrow: 0, output: 0, bitmap: 0, bitmapErr: 0, draw: 0, lastErr: "" };
 function dlHudRender() {
   const el = document.getElementById("dlHud");
   if (!el) return;
   const st = downlinkDecoder ? downlinkDecoder.state : "none";
   const q = downlinkDecoder ? downlinkDecoder.decodeQueueSize : "-";
+  const rate = (value) => Number.isFinite(value) ? value.toFixed(1) : "-";
+  const wireKiB = ws ? Math.round(ws.bufferedAmount / 1024) : 0;
   el.textContent =
     `[${DL_BUILD}] codec=${activeDownlinkCodec} dec=${st} q=${q} sawKey=${downlinkSawKey ? 1 : 0}` +
-    ` | recv=${dlStat.recv} dropWait=${dlStat.dropWait} decode=${dlStat.decodeCalls} thr=${dlStat.decodeThrow}` +
+    ` | fps up/rx/play=${rate(sendActualFps)}/${rate(receiveActualFps)}/${rate(editActualFps)}` +
+    ` buf=${outputFrameQueue.length}/${outputQueueTargetFrames()} pending=${backendPendingFrames()} ws=${wireKiB}KiB` +
+    ` | recv=${dlStat.recv} dropWait=${dlStat.dropWait} restart=${dlStat.restart} decode=${dlStat.decodeCalls} thr=${dlStat.decodeThrow}` +
     ` out=${dlStat.output} bmp=${dlStat.bitmap}/${dlStat.bitmapErr} draw=${dlStat.draw}` +
     (dlStat.lastErr ? ` | ERR:${dlStat.lastErr}` : "");
 }
@@ -986,8 +999,11 @@ function sendTargetFps() {
 
 function outputPlaybackFps() {
   const configured = sendTargetFps();
-  const measured = cameraMeasuredFps > 0.5 ? cameraMeasuredFps : (cameraTrackFps || configured);
-  return Math.max(1, Math.min(configured, measured || configured));
+  // Frames are submitted on the configured timer even when the physical
+  // camera reports a lower/unstable capture rate. Using that measured rate
+  // here made the output consumer slower than the producer and built seconds
+  // of decoded-frame backlog.
+  return Math.max(1, configured);
 }
 
 function outputQueueDelayMs() {
@@ -1154,28 +1170,29 @@ function effectivePlaybackIntervalMs() {
   const base = Math.max(16, Math.round(1000 / outputPlaybackFps()));
   const q = outputFrameQueue.length;
   const target = outputQueueTargetFrames();
-  if (q <= target) return base;
-  const over = (q - target) / Math.max(1, target);
-  const speed = Math.min(2, 1 + over);
+  // The model emits eight-frame bursts. A rigid 24 fps consumer eventually
+  // drains the jitter buffer whenever sustained production is even a fraction
+  // below 24 fps, causing the visible pause/re-prime cycle. Keep playback near
+  // 24 fps while gently steering the queue back toward its one-second target.
+  // The narrow correction band is visually imperceptible and avoids both
+  // underruns and the old 2x catch-up bursts.
+  const error = (q - target) / Math.max(1, target);
+  const speed = Math.max(0.92, Math.min(1.08, 1 + 0.30 * error));
   return Math.max(8, Math.round(base / speed));
-}
-
-function alignTargetMs() {
-  return Math.min(2500, Math.max(300, alignMaxAgeMs + 120));
 }
 
 function pumpOutputFrame() {
   if (!smoothPlaybackEnabled()) return;
-  const T = alignTargetMs();
-  const now = Date.now();
-  let shown = 0;
-  while (outputFrameQueue.length > 0 && shown < 4) {
-    const head = outputFrameQueue[0];
-    const tcap = head.meta && Number(head.meta.t_capture_ms);
-    if (tcap && (now - tcap) < T) break;
-    displayOutputFrame(outputFrameQueue.shift());
-    shown++;
+  trimOutputQueueForLatency();
+  if (!outputPlaybackPrimed) {
+    if (outputFrameQueue.length < outputQueueTargetFrames()) {
+      ensureOutputPlaybackTimer();
+      return;
+    }
+    outputPlaybackPrimed = true;
   }
+  if (outputFrameQueue.length > 0) displayOutputFrame(outputFrameQueue.shift());
+  if (outputFrameQueue.length === 0) outputPlaybackPrimed = false;
   ensureOutputPlaybackTimer();
 }
 
@@ -1196,6 +1213,7 @@ function ensureOutputPlaybackTimer(force = false) {
 function clearOutputQueue() {
   for (const item of outputFrameQueue) disposeItem(item);
   outputFrameQueue = [];
+  outputPlaybackPrimed = false;
 }
 
 function resetRunMetrics() {
@@ -1273,18 +1291,14 @@ function onDecodedOutputFrame(videoFrame, meta) {
 }
 
 function enqueueOutputItem(item, meta) {
-  if (!smoothPlaybackEnabled()) {
-    displayOutputFrame(item);
-    return;
-  }
   const tc = Number(item.meta && item.meta.t_capture_ms) || 0;
   if (tc && tc <= lastShownCaptureMs) {
     disposeItem(item); outputQueueDroppedFrames += 1;
     return;
   }
-  if (meta && meta.t_capture_ms && !(meta.profile && meta.profile.passthrough)) {
-    const age = Date.now() - Number(meta.t_capture_ms);
-    if (age > 0 && age < 5000) alignMaxAgeMs = Math.max(age, alignMaxAgeMs * 0.99);
+  if (!smoothPlaybackEnabled()) {
+    displayOutputFrame(item);
+    return;
   }
   outputFrameQueue.push(item);
   if (tc) {
@@ -1295,10 +1309,7 @@ function enqueueOutputItem(item, meta) {
     }
     outputFrameQueue[i] = item;
   }
-  while (outputFrameQueue.length > 120) {
-    const dropped = outputFrameQueue.shift();
-    if (dropped) { disposeItem(dropped); outputQueueDroppedFrames += 1; }
-  }
+  trimOutputQueueForLatency();
   ensureOutputPlaybackTimer();
   updateMetrics();
 }
@@ -1310,6 +1321,7 @@ function flushOutputQueueToLatest() {
     outputQueueDroppedFrames += 1;
   }
   if (outputFrameQueue.length === 1) displayOutputFrame(outputFrameQueue.shift());
+  outputPlaybackPrimed = false;
 }
 
 function measureCameraFrame(now) {
@@ -1445,16 +1457,28 @@ async function tick() {
     const width = Number(document.getElementById("width").value);
     const height = Number(document.getElementById("height").value);
     if (activeUplinkCodec === "h264") {
-      if (!uplinkEncoder || uplinkEncoderError) {
+      if (!uplinkEncoder || uplinkEncoderError || uplinkEncoder.state === "closed") {
+        try { setupUplinkEncoder(true); }
+        catch (err) {
+          sendRealtimeSkips += 1;
+          updateMetrics();
+          return;
+        }
+      }
+      // WebCodecs can continue accepting frames while its native encoder is
+      // already behind. Keep at most a couple queued so a loaded client/VPN
+      // drops current capture frames instead of transmitting stale video.
+      if (uplinkEncoder.encodeQueueSize > 2 || uplinkPendingMeta.length > 4) {
         sendRealtimeSkips += 1;
         updateMetrics();
         return;
       }
-      const seq = sentFrames + 1;
+      const seq = uplinkFrameIndex + 1;
       const tCaptureMs = Date.now();
       try {
         drawFrameToCanvas(width, height);
-        const vf = new VideoFrame(capture, { timestamp: uplinkFrameIndex * 1000 });
+        const timestampUs = Math.round(uplinkFrameIndex * 1_000_000 / sendTargetFps());
+        const vf = new VideoFrame(capture, { timestamp: timestampUs });
         uplinkFrameIndex += 1;
         const keyFrame = uplinkForceKeyframe || (uplinkFrameIndex % (sendTargetFps() * 2) === 1);
         uplinkForceKeyframe = false;
@@ -1720,7 +1744,6 @@ async function start() {
         // stamps from ~RTT ago, which are < Date.now() and would all be dropped
         // as stale at the enqueue guard -> output pane stays black forever.
         lastShownCaptureMs = 0;
-        alignMaxAgeMs = 0;
         if (usingVideoFile) {
           try { camera.pause(); } catch (err) {}
           startVideoPull();
@@ -1844,7 +1867,16 @@ async function start() {
     const frameCodec = (meta && meta.codec) || "jpeg";
     if (frameCodec === "h264" && activeDownlinkCodec === "h264") {
       dlStat.recv += 1;
-      if (!downlinkDecoder || downlinkDecoderError) { dlStat.lastErr = downlinkDecoderError ? "decErrFlag" : "noDecoder"; return; }
+      if (!downlinkDecoder || downlinkDecoderError || downlinkDecoder.state === "closed") {
+        try {
+          setupDownlinkDecoder();
+          dlStat.restart += 1;
+          dlStat.lastErr = "";
+        } catch (err) {
+          dlStat.lastErr = "restart:" + (err && (err.message || err) || "unknown");
+          return;
+        }
+      }
       const isKey = !!(meta && meta.key);
       if (!downlinkSawKey && !isKey) { dlStat.dropWait += 1; return; }
       if (isKey) downlinkSawKey = true;
@@ -1852,7 +1884,9 @@ async function start() {
       try {
         const chunk = new EncodedVideoChunk({
           type: isKey ? "key" : "delta",
-          timestamp: (meta && Number(meta.source_seq)) ? Number(meta.source_seq) * 1000 : 0,
+          timestamp: (meta && Number(meta.source_seq))
+            ? Math.round(Number(meta.source_seq) * 1_000_000 / sendTargetFps())
+            : 0,
           data: bytes,
         });
         downlinkPendingMeta.push(meta);

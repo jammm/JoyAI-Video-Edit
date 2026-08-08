@@ -11,7 +11,9 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from functools import partial
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,69 @@ from xvideo.serving.joyomni_streaming import (
 DEFAULT_DIT_CKPT = str(REPO_ROOT / "deps" / "checkpoints" / "JoyAI-Video-Edit" / "dit" / "joyai_video_edit_dit_0804.pth")
 DEFAULT_FACE_DETECTOR_ONNX = str(REPO_ROOT / "deps" / "checkpoints" / "face_detection_yunet_2023mar.onnx")
 DEFAULT_PERSON_DETECTOR_ONNX = str(REPO_ROOT / "deps" / "checkpoints" / "yolov8n.onnx")
+DEFAULT_PERSON_DETECTOR_PT = str(REPO_ROOT / "deps" / "checkpoints" / "yolov8n.pt")
+
+
+_ROCPROF_SELECTED_REGIONS = os.environ.get(
+    "JOYOMNI_ROCPROF_SELECTED_REGIONS", ""
+).lower() in {"1", "true", "yes", "on"}
+_ROCPROF_ROCTX = None
+
+
+def _rocprof_selected_region(*, resume: bool) -> None:
+    """Control rocprofv3 ``--selected-regions`` around a live session.
+
+    This is opt-in because these ROCTx control calls affect every profiler in
+    the process.  Keeping startup and model warmup outside the selected region
+    makes a short kernel trace representative of steady-state streaming.
+    """
+    if not _ROCPROF_SELECTED_REGIONS:
+        return
+
+    import ctypes
+
+    global _ROCPROF_ROCTX
+    if _ROCPROF_ROCTX is None:
+        _ROCPROF_ROCTX = ctypes.CDLL("librocprofiler-sdk-roctx.so.1")
+        for name in ("roctxProfilerPause", "roctxProfilerResume"):
+            fn = getattr(_ROCPROF_ROCTX, name)
+            fn.argtypes = [ctypes.c_uint64]
+            fn.restype = ctypes.c_int
+
+    name = "roctxProfilerResume" if resume else "roctxProfilerPause"
+    status = int(getattr(_ROCPROF_ROCTX, name)(0))
+    if status != 0:
+        raise RuntimeError(f"{name}(0) failed with status {status}")
+    print(f"#####[ROCPROF] selected region {'resumed' if resume else 'paused'}", flush=True)
+
+
+def _configure_rocm_tunableop() -> None:
+    """Load an offline gfx950 GEMM selection table before model warmup."""
+    filename = os.environ.get("JOYOMNI_TUNABLEOP_FILE", "").strip()
+    if not filename:
+        return
+
+    import torch
+
+    if torch.version.hip is None:
+        return
+    path = Path(filename)
+    if not path.is_file():
+        print(f"#####[TUNABLEOP] table not found; using library defaults: {path}", flush=True)
+        return
+
+    from torch.cuda import tunable
+
+    tunable.set_filename(str(path), insert_device_ordinal=False)
+    tunable.enable(True)
+    tunable.tuning_enable(False)
+    if not tunable.read_file(str(path)):
+        raise RuntimeError(f"TunableOp rejected gfx950 table {path}")
+    print(
+        f"#####[TUNABLEOP] loaded {len(tunable.get_results())} gfx950 GEMM selections from {path}",
+        flush=True,
+    )
+
 
 class SessionGate:
     def __init__(self) -> None:
@@ -161,10 +226,21 @@ class _DownlinkH264Encoder:
         }
         self._av = av
         self._pts = 0
+        self._lock = threading.Lock()
+        self._closed = False
         from av.video.frame import PictureType
         self._I_TYPE = PictureType.I
 
     def encode(self, frames_u8: list) -> tuple[list[bytes], list[bool]]:
+        # PyAV/libx264 contexts are stateful and not thread-safe.  A cancelled
+        # asyncio.to_thread call can continue in the worker after the coroutine
+        # is gone, so close() must also share this lifetime lock.
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("H.264 encoder is closed")
+            return self._encode_locked(frames_u8)
+
+    def _encode_locked(self, frames_u8: list) -> tuple[list[bytes], list[bool]]:
         import numpy as np
         packets: list[bytes] = []
         keys: list[bool] = []
@@ -197,15 +273,19 @@ class _DownlinkH264Encoder:
         return packets, keys
 
     def close(self) -> None:
-        try:
-            for _ in self._ctx.encode(None):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                for _ in self._ctx.encode(None):
+                    pass
+            except Exception:
                 pass
-        except Exception:
-            pass
-        try:
-            self._ctx.close()
-        except Exception:
-            pass
+            try:
+                self._ctx.close()
+            except Exception:
+                pass
 
 def _decode_ref_image(value: str | None) -> Image.Image | None:
     if not value:
@@ -215,6 +295,7 @@ def _decode_ref_image(value: str | None) -> Image.Image | None:
 
 
 _FACE_DETECTOR: dict[str, Any] = {}
+_FACE_DETECTOR_MAX_SIDE = 640
 
 def _get_face_detector(onnx_path: str, score_thresh: float):
     if not onnx_path:
@@ -235,15 +316,31 @@ def _get_face_detector(onnx_path: str, score_thresh: float):
     _FACE_DETECTOR[onnx_path] = det
     return det or None
 
+def _face_detector_input(image: Image.Image):
+    """Build a bounded detector-only image without changing the model input."""
+    import cv2
+    import numpy as np
+
+    rgb = np.asarray(image if image.mode == "RGB" else image.convert("RGB"))
+    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+    height, width = bgr.shape[:2]
+    longest = max(height, width)
+    if longest > _FACE_DETECTOR_MAX_SIDE:
+        scale = _FACE_DETECTOR_MAX_SIDE / float(longest)
+        resized = (
+            max(2, int(round(width * scale))),
+            max(2, int(round(height * scale))),
+        )
+        bgr = cv2.resize(bgr, resized, interpolation=cv2.INTER_AREA)
+    return bgr
+
 def _check_face_gate(image: Image.Image, *, onnx_path: str,
                      score_thresh: float, min_below_ratio: float,
                      count_min_ratio: float = 0.45):
     det = _get_face_detector(onnx_path, score_thresh)
     if det is None:
         return (None, None, 0)
-    import numpy as np
-    rgb = np.asarray(image if image.mode == "RGB" else image.convert("RGB"))
-    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+    bgr = _face_detector_input(image)
     h, w = bgr.shape[:2]
     det.setScoreThreshold(float(score_thresh))
     det.setInputSize((w, h))
@@ -280,9 +377,7 @@ def _face_present(image: Image.Image, *, onnx_path: str, score_thresh: float, mi
     det = _get_face_detector(onnx_path, score_thresh)
     if det is None:
         return True
-    import numpy as np
-    rgb = np.asarray(image if image.mode == "RGB" else image.convert("RGB"))
-    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+    bgr = _face_detector_input(image)
     h, w = bgr.shape[:2]
     det.setInputSize((w, h))
     _, faces = det.detect(bgr)
@@ -304,6 +399,36 @@ def _face_present(image: Image.Image, *, onnx_path: str, score_thresh: float, mi
 
 
 _PERSON_NET: dict[str, Any] = {}
+_PERSON_YOLO: dict[tuple[str, str, str], Any] = {}
+_PERSON_YOLO_LOCK = threading.Lock()
+
+
+def _get_person_yolo(pt_path: str, *, device: str, compile_mode: str):
+    """Load one native PyTorch YOLO model for the selected accelerator."""
+    if not pt_path:
+        return None
+    key = (pt_path, device, compile_mode)
+    if key in _PERSON_YOLO:
+        return _PERSON_YOLO[key] or None
+
+    model = False
+    try:
+        if not os.path.exists(pt_path):
+            print(f"#####[PERSON-GATE] YOLO PyTorch weight not found: {pt_path}", flush=True)
+        else:
+            from ultralytics import YOLO
+
+            model = YOLO(pt_path)
+            print(
+                f"#####[PERSON-GATE] YOLO PyTorch loaded: {pt_path} "
+                f"(device={device}, compile={compile_mode or 'off'})",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"#####[PERSON-GATE] failed to load PyTorch YOLO ({exc!r})", flush=True)
+        model = False
+    _PERSON_YOLO[key] = model
+    return model or None
 
 def _get_person_net(onnx_path: str):
     if not onnx_path:
@@ -324,17 +449,88 @@ def _get_person_net(onnx_path: str):
     _PERSON_NET[onnx_path] = net
     return net or None
 
-def _person_present(image: Image.Image, *, onnx_path: str, conf: float) -> bool:
+def _person_present(
+    image: Image.Image,
+    *,
+    onnx_path: str,
+    pt_path: str = "",
+    device: str = "cuda:0",
+    compile_mode: str = "",
+    conf: float,
+) -> bool:
+    # Prefer Ultralytics' native PyTorch model. PyTorch keeps the `cuda`
+    # spelling on ROCm. Ultralytics predictor/model state is mutable; serialize
+    # access in case WebSocket sessions overlap during teardown.
+    if pt_path:
+        with _PERSON_YOLO_LOCK:
+            yolo = _get_person_yolo(pt_path, device=device, compile_mode=compile_mode)
+            if yolo is not None:
+                try:
+                    import numpy as np
+
+                    rgb = np.ascontiguousarray(
+                        np.asarray(image if image.mode == "RGB" else image.convert("RGB"))
+                    )
+                    result = yolo.predict(
+                        source=rgb,
+                        imgsz=320,
+                        device=device,
+                        quantize=16 if device != "cpu" else None,
+                        classes=[0],
+                        conf=float(conf),
+                        max_det=1,
+                        rect=False,
+                        verbose=False,
+                        compile=compile_mode or False,
+                    )[0]
+                    return result.boxes is not None and len(result.boxes) > 0
+                except Exception as exc:
+                    key = (pt_path, device, compile_mode)
+                    print(
+                        f"#####[PERSON-GATE] PyTorch YOLO inference failed ({exc!r}) "
+                        "-> falling back",
+                        flush=True,
+                    )
+                    _PERSON_YOLO[key] = False
+
     net = _get_person_net(onnx_path)
     if net is None:
         return True
-    import numpy as np
-    import cv2
-    rgb = np.ascontiguousarray(np.asarray(image if image.mode == "RGB" else image.convert("RGB")))
-    blob = cv2.dnn.blobFromImage(rgb, 1.0 / 255.0, (320, 320), swapRB=False, crop=False)
-    net.setInput(blob)
-    out = net.forward()
-    return float(out[0, 4, :].max()) >= float(conf)
+    try:
+        import numpy as np
+        import cv2
+        rgb = np.ascontiguousarray(np.asarray(image if image.mode == "RGB" else image.convert("RGB")))
+        blob = cv2.dnn.blobFromImage(rgb, 1.0 / 255.0, (320, 320), swapRB=False, crop=False)
+        net.setInput(blob)
+        out = net.forward()
+        return float(out[0, 4, :].max()) >= float(conf)
+    except Exception as exc:
+        # The upstream gate expects a fixed-320 export, while common public
+        # YOLOv8n ONNX files are fixed at 640.  A detector mismatch must not
+        # terminate the WebSocket session: person monitoring is optional and
+        # already fails open when the weight is absent or cannot be loaded.
+        print(f"#####[PERSON-GATE] YOLO inference failed ({exc!r}) -> DISABLED", flush=True)
+        _PERSON_NET[onnx_path] = False
+        return True
+
+
+def _warm_person_detector(args: argparse.Namespace) -> None:
+    """Compile and warm the optional detector before accepting WebSockets."""
+    if not args.person_detector_pt or not os.path.exists(args.person_detector_pt):
+        return
+    started = time.perf_counter()
+    _person_present(
+        Image.new("RGB", (320, 320)),
+        onnx_path=args.person_detector_onnx,
+        pt_path=args.person_detector_pt,
+        device=args.device,
+        compile_mode=args.person_detector_compile,
+        conf=float(args.person_gate_conf),
+    )
+    print(
+        f"#####[PERSON-GATE] ROCm detector warmup done in {time.perf_counter() - started:.2f}s",
+        flush=True,
+    )
 
 def _enhance_prompt_sync(
     *,
@@ -541,7 +737,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             return app.state.runtime
         with app.state.runtime_lock:
             if app.state.runtime is None:
-                app.state.runtime = JoyOmniRuntime.load(
+                runtime = JoyOmniRuntime.load(
                     args.dit_ckpt,
                     vae_ckpt=args.vae_ckpt,
                     text_encoder_ckpt=args.text_encoder_ckpt,
@@ -552,19 +748,56 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     vae_pseudo_device=args.vae_pseudo_device,
                     postprocess_device=args.postprocess_device,
                     seed=args.seed,
+                    warmup_height=args.height,
+                    warmup_width=args.width,
                 )
+                app.state.runtime = runtime
         return app.state.runtime
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        if args.preload:
-            get_runtime()
-        yield
+        try:
+            if args.preload:
+                runtime = get_runtime()
+                # Live frame submission must stay on one persistent host
+                # thread. Warming on the main thread and then entering ROCm
+                # through arbitrary asyncio-pool threads caused a one-time
+                # 30-50 second specialization in the first browser session.
+                live_warmup = partial(
+                    runtime.warmup_full_pipeline,
+                    height=args.height,
+                    width=args.width,
+                    prompt=args.prompt,
+                    num_inference_steps=args.num_inference_steps,
+                    max_temporal_ids=(
+                        args.max_temporal_ids
+                        if args.max_temporal_ids is not None
+                        else 8
+                    ),
+                    freeze_kv_on_static=args.freeze_kv_on_static,
+                    static_diff_thresh=args.static_diff_thresh,
+                )
+                await asyncio.get_running_loop().run_in_executor(
+                    _app.state.frame_executor,
+                    live_warmup,
+                )
+                _warm_person_detector(args)
+            yield
+        finally:
+            await asyncio.to_thread(
+                _app.state.frame_executor.shutdown,
+                wait=True,
+                cancel_futures=True,
+            )
 
     app = FastAPI(lifespan=lifespan)
     app.state.args = args
     app.state.runtime = None
     app.state.runtime_lock = threading.Lock()
+    app.state.frame_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="joyomni-frame-submit",
+    )
     app.state.inference_lock = threading.Lock()
     app.state.active_session = None
     app.state.ws_debug = {}
@@ -590,7 +823,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "use_pe": args.use_pe,
             "max_temporal_ids": args.max_temporal_ids,
 
-            "record_enabled": args.record_dir is not None,
+            "record_enabled": bool(args.record_dir),
         }
         html = _load_index_html().replace("__SERVER_DEFAULTS__", json.dumps(server_defaults))
         return HTMLResponse(html)
@@ -762,7 +995,19 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         send_lock = asyncio.Lock()
         stop_output_pump = asyncio.Event()
         output_task: asyncio.Task[None] | None = None
+        rocprof_region_active = False
         loop = asyncio.get_running_loop()
+        first_frame_receive_mono: float | None = None
+        last_frame_receive_mono: float | None = None
+        person_monitor_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="joyomni-person-monitor",
+        )
+        person_monitor_future: Future[dict[str, Any]] | None = None
+        person_monitor_epoch = 0
+        person_monitor_last_chunk = 0
+        person_monitor_last_submit_frame = 0
+        person_monitor_next_at = 0.0
 
         rec_input: _SegmentedRecorder | None = None
         rec_output: _SegmentedRecorder | None = None
@@ -772,6 +1017,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "connected_at": time.time(),
             "frames_in": 0,
             "frames_out": 0,
+            "input_fps": 0.0,
+            "input_interval_ms": None,
+            "frame_process_ms": None,
             "output_bytes": 0,
             "chunk_results_sent": 0,
             "last_receive_at": None,
@@ -784,7 +1032,59 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "kv_reset_count": reset_count,
             "frames_since_session_reset": frames_since_session_reset,
             "send_state": "idle",
+            "person_monitor_state": "idle",
+            "person_monitor_submitted": 0,
+            "person_monitor_completed": 0,
         }
+
+        def _run_person_monitor(
+            frame: Image.Image,
+            epoch: int,
+            *,
+            monitor_presence: bool,
+            monitor_face: bool,
+            monitor_count: bool,
+        ) -> dict[str, Any]:
+            """Run one latest-frame monitor sample without blocking frame ACKs."""
+            started = time.perf_counter()
+            body_present = True
+            face_present = True
+            face_count: int | None = None
+
+            if monitor_presence:
+                body_present = _person_present(
+                    frame,
+                    onnx_path=args.person_detector_onnx,
+                    pt_path=args.person_detector_pt,
+                    device=args.device,
+                    compile_mode=args.person_detector_compile,
+                    conf=float(args.person_gate_conf),
+                )
+                if monitor_face and body_present:
+                    face_present = _face_present(
+                        frame,
+                        onnx_path=args.face_detector_onnx,
+                        score_thresh=fg_score,
+                        min_ratio=float(args.face_present_min_ratio),
+                        edge_margin=float(args.face_present_edge_margin),
+                    )
+
+            if monitor_count:
+                _, _, face_count = _check_face_gate(
+                    frame,
+                    onnx_path=args.face_detector_onnx,
+                    score_thresh=fg_score,
+                    min_below_ratio=fg_min_below,
+                    count_min_ratio=float(args.count_face_min_ratio),
+                )
+
+            return {
+                "epoch": epoch,
+                "body_present": body_present,
+                "face_present": face_present,
+                "face_count": face_count,
+                "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+            }
 
         async def _send_json(payload: dict[str, Any]) -> None:
             async with send_lock:
@@ -925,7 +1225,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 print(
                     f"#####[SERVER] chunk={profile.get('chunk_idx')} count={count} "
                     f"jpeg_dec={float(profile.get('jpeg_decode_ms', 0.0)):.0f}ms "
-                    f"jpeg_enc={float(profile.get('jpeg_encode_s', 0.0)) * 1000:.0f}ms "
+                    f"pack={float(profile.get('pack_frames_s', 0.0)) * 1000:.0f}ms "
+                    f"wire_enc={float(profile.get('downlink_encode_s', 0.0)) * 1000:.0f}ms "
                     f"ws_send={float(profile.get('ws_send_s', 0.0)) * 1000:.0f}ms "
                     f"residence={float(profile.get('server_residence_s', 0.0)) * 1000:.0f}ms",
                     flush=True,
@@ -938,35 +1239,102 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             fallback_meta: dict[str, Any] | None = None,
             fallback_elapsed: float = 0.0,
         ) -> int:
-            output_frames = result.frames
-            if not output_frames:
-                return 0
-            if result.source_metas:
-                source_metas = result.source_metas
-            elif fallback_meta is not None:
-                source_metas = [fallback_meta] * len(output_frames)
-            else:
-                source_metas = [{} for _ in output_frames]
             server_elapsed = float(result.elapsed or fallback_elapsed)
-
             profile = result.profile
             _prof = bool(profile.get("profile_timings"))
 
-            def _enc(imgs=output_frames):
-                import numpy as np
-                fu8 = [np.ascontiguousarray(np.asarray(im.convert("RGB"), dtype=np.uint8)) for im in imgs]
-                enc, keys = _encode_downlink(fu8)
-                return fu8, enc, keys
+            def _record_encode_time(elapsed_s: float, *, transcode: bool = False) -> None:
+                if not _prof:
+                    return
+                profile["downlink_encode_s"] = float(profile.get("downlink_encode_s", 0.0)) + elapsed_s
+                if downlink_codec == "h264":
+                    key = "h264_transcode_s" if transcode else "h264_encode_s"
+                else:
+                    key = "jpeg_encode_s"
+                profile[key] = float(profile.get(key, 0.0)) + elapsed_s
 
-            if _prof:
-                _enc_t0 = time.perf_counter()
-                frames_u8, encoded_frames, keys = await asyncio.to_thread(_enc)
-                profile["jpeg_encode_s"] = time.perf_counter() - _enc_t0
+            rec_frames = None
+            encoded_frames: list[bytes]
+            keys: list[bool]
+
+            if result.pixels is not None:
+                def _enc_pixels(pixels=result.pixels):
+                    import numpy as np
+                    value = pixels.detach() if hasattr(pixels, "detach") else pixels
+                    value = value.cpu() if hasattr(value, "cpu") else value
+                    value = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+                    if value.ndim != 4 or value.shape[-1] != 3:
+                        raise ValueError(
+                            f"expected output pixels shaped [T,H,W,3], got {value.shape}"
+                        )
+                    frames_u8 = [
+                        np.ascontiguousarray(frame, dtype=np.uint8) for frame in value
+                    ]
+                    enc, frame_keys = _encode_downlink(frames_u8)
+                    return frames_u8, enc, frame_keys
+
+                encode_started = time.perf_counter()
+                rec_frames, encoded_frames, keys = await asyncio.to_thread(_enc_pixels)
+                _record_encode_time(time.perf_counter() - encode_started)
+            elif result.frames:
+                output_frames = result.frames
+
+                def _enc_frames(imgs=output_frames):
+                    import numpy as np
+                    frames_u8 = [
+                        np.ascontiguousarray(np.asarray(im.convert("RGB"), dtype=np.uint8))
+                        for im in imgs
+                    ]
+                    enc, frame_keys = _encode_downlink(frames_u8)
+                    return frames_u8, enc, frame_keys
+
+                encode_started = time.perf_counter()
+                rec_frames, encoded_frames, keys = await asyncio.to_thread(_enc_frames)
+                _record_encode_time(time.perf_counter() - encode_started)
+            elif result.jpegs:
+                if downlink_codec == "h264" and downlink_encoder is not None:
+                    # Compatibility for results produced by an older session:
+                    # current sessions hand off RGB pixels and skip this lossy
+                    # JPEG decode/re-encode round trip.
+                    def _transcode(jpegs=result.jpegs):
+                        import cv2
+                        import numpy as np
+                        rgb = []
+                        for encoded in jpegs:
+                            bgr = cv2.imdecode(
+                                np.frombuffer(encoded, dtype=np.uint8),
+                                cv2.IMREAD_COLOR,
+                            )
+                            if bgr is None:
+                                raise ValueError("failed to decode legacy JPEG output")
+                            rgb.append(np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
+                        enc, frame_keys = downlink_encoder.encode(rgb)
+                        return rgb, enc, frame_keys
+
+                    encode_started = time.perf_counter()
+                    rec_frames, encoded_frames, keys = await asyncio.to_thread(_transcode)
+                    _record_encode_time(time.perf_counter() - encode_started, transcode=True)
+                else:
+                    encoded_frames = result.jpegs
+                    keys = [False] * len(encoded_frames)
             else:
-                frames_u8, encoded_frames, keys = await asyncio.to_thread(_enc)
+                return 0
+
+            output_count = len(encoded_frames)
+            if result.source_metas:
+                source_metas = result.source_metas
+            elif fallback_meta is not None:
+                source_metas = [fallback_meta] * output_count
+            else:
+                source_metas = [{} for _ in range(output_count)]
+
             return await _send_encoded_frames(
-                encoded_frames, source_metas, profile, server_elapsed,
-                keys=keys, rec_frames=frames_u8,
+                encoded_frames,
+                source_metas,
+                profile,
+                server_elapsed,
+                keys=keys,
+                rec_frames=rec_frames,
             )
 
         async def _output_pump(session_ref) -> None:
@@ -978,35 +1346,25 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     break
                 if result is None:
                     continue
-                if result.jpegs:
-                    source_metas = result.source_metas or [{} for _ in result.jpegs]
-                    if downlink_codec == "h264" and downlink_encoder is not None:
-                        # The session worker always packs output as JPEG bytes
-                        # (result.jpegs). For an h264 downlink we must transcode:
-                        # decode those JPEGs back to RGB pixels and re-encode via
-                        # the h264 encoder so real keyframe flags are produced.
-                        # Sending JPEG bytes tagged codec=h264 (the old behavior)
-                        # made the browser VideoDecoder drop every frame as a
-                        # keyframe-less delta -> permanent black output pane.
-                        def _transcode(jpegs=result.jpegs):
-                            import cv2, numpy as np
-                            rgb = []
-                            for b in jpegs:
-                                bgr = cv2.imdecode(np.frombuffer(b, dtype=np.uint8), cv2.IMREAD_COLOR)
-                                rgb.append(np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
-                            enc, keys = downlink_encoder.encode(rgb)
-                            return rgb, enc, keys
-                        rec_frames, enc_frames, keys = await asyncio.to_thread(_transcode)
-                        await _send_encoded_frames(
-                            enc_frames, source_metas, result.profile,
-                            float(result.elapsed or 0.0), keys=keys, rec_frames=rec_frames,
-                        )
-                    else:
-                        await _send_encoded_frames(
-                            result.jpegs, source_metas, result.profile, float(result.elapsed or 0.0)
-                        )
-                elif result.frames:
+                try:
                     await _send_chunk_result(result)
+                except WebSocketDisconnect:
+                    stop_output_pump.set()
+                    break
+                except Exception as exc:
+                    # Do not leave a live inference session producing raw RGB
+                    # chunks after its codec/socket output path has failed.
+                    ws_debug["output_error"] = repr(exc)
+                    stop_output_pump.set()
+                    try:
+                        await _send_json({"type": "error", "message": repr(exc)})
+                    except Exception:
+                        pass
+                    try:
+                        await websocket.close(code=1011)
+                    except Exception:
+                        pass
+                    break
 
         def _create_session():
             if session_settings is None:
@@ -1062,7 +1420,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         async def _close_session_safely(session_ref, reason: str) -> None:
             try:
                 await asyncio.wait_for(
-                    asyncio.to_thread(_close_session_sync, session_ref),
+                    loop.run_in_executor(
+                        app.state.frame_executor,
+                        _close_session_sync,
+                        session_ref,
+                    ),
                     timeout=max(0.1, float(args.session_close_timeout_s)),
                 )
             except asyncio.TimeoutError:
@@ -1088,9 +1450,26 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     pass
             output_task = None
 
+        async def _stop_person_monitor() -> None:
+            nonlocal person_monitor_epoch, person_monitor_future
+            person_monitor_epoch += 1
+            if person_monitor_future is not None:
+                person_monitor_future.cancel()
+            # A running HIP call cannot be cancelled. Let the one bounded
+            # sample finish before model/session teardown mutates GPU state.
+            await asyncio.to_thread(
+                person_monitor_pool.shutdown,
+                wait=True,
+                cancel_futures=True,
+            )
+            person_monitor_future = None
+
         def _start_recorders() -> None:
             nonlocal rec_input, rec_output, rec_seq, rec_base
-            if args.record_dir is None:
+            # An empty --record-dir explicitly disables recording. This keeps
+            # the live demo from running two additional CPU encoders when the
+            # priority is uninterrupted low-latency playback.
+            if not args.record_dir:
                 return
             _stop_recorders()
             try:
@@ -1196,18 +1575,28 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             app.state.ws_debug = ws_debug
 
             HOLDER_IDLE_TIMEOUT_S = 10.0
+            # Do not evict a connected client merely because it has filled the
+            # bounded input window and is waiting for an in-flight GPU chunk.
+            # This also lets the one-time live-session graph specialization
+            # finish. A genuinely wedged backend is still released eventually.
+            HOLDER_INFLIGHT_TIMEOUT_S = 120.0
             last_activity = time.monotonic()
             last_frames_out = frames_out
             while True:
                 if frames_out != last_frames_out:
                     last_frames_out = frames_out
                     last_activity = time.monotonic()
-                if time.monotonic() - last_activity >= HOLDER_IDLE_TIMEOUT_S:
+                holder_timeout_s = (
+                    HOLDER_INFLIGHT_TIMEOUT_S
+                    if session is not None and frames_in > frames_out
+                    else HOLDER_IDLE_TIMEOUT_S
+                )
+                if time.monotonic() - last_activity >= holder_timeout_s:
                     try:
                         await _send_json(
                             {
                                 "type": "session_timeout",
-                                "message": f"released after {HOLDER_IDLE_TIMEOUT_S:.0f}s idle; reconnect to re-queue",
+                                "message": f"released after {holder_timeout_s:.0f}s idle; reconnect to re-queue",
                             }
                         )
                     except Exception:
@@ -1298,6 +1687,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         gate_state["pe_anchor"] = None
                         gate_state["settle_ax"] = None
                         gate_state["settle_ay"] = None
+                        person_monitor_epoch += 1
+                        if person_monitor_future is not None and person_monitor_future.cancel():
+                            person_monitor_future = None
+                        person_monitor_last_chunk = int(ws_debug.get("chunk_results_sent", 0))
+                        person_monitor_last_submit_frame = frames_in
+                        person_monitor_next_at = 0.0
+                        ws_debug["person_monitor_state"] = "idle"
                         if face_gate_pending:
                             print(f"#####[FACE-GATE] armed (mode=upper[all], score={fg_score}, min_below={fg_min_below}, stable={fg_stable}, absent={fg_absent})", flush=True)
                         pe_report = None
@@ -1328,6 +1724,16 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                             max_temporal_ids=max_temporal_ids,
                             freeze_kv_on_static=freeze_kv_on_static,
                             static_diff_thresh=static_diff_thresh,
+                            cache_last_denoise_kv=(
+                                bool(payload["cache_last_denoise_kv"])
+                                if "cache_last_denoise_kv" in payload
+                                else None
+                            ),
+                            clean_kv_prefix_layers=(
+                                int(payload["clean_kv_prefix_layers"])
+                                if "clean_kv_prefix_layers" in payload
+                                else None
+                            ),
                             profile_timings=bool(payload.get("profile_timings", args.profile_timings)),
                         )
 
@@ -1401,12 +1807,18 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         )
                         _start_recorders()
                         _start_output_task(session)
+                        if not rocprof_region_active:
+                            _rocprof_selected_region(resume=True)
+                            rocprof_region_active = True
                     elif msg_type == "stop":
                         ws_debug["last_message_type"] = "stop"
 
                         await _stop_output_task()
                         _stopped_rec = rec_base
                         await asyncio.to_thread(_stop_recorders)
+                        if rocprof_region_active:
+                            _rocprof_selected_region(resume=False)
+                            rocprof_region_active = False
                         if _stopped_rec is not None:
                             app.state.last_recording_dir = str(_stopped_rec)
                         break
@@ -1457,6 +1869,20 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 frame_bytes = message["bytes"]
                 frames_in += 1
                 last_activity = time.monotonic()
+                receive_mono = time.monotonic()
+                if first_frame_receive_mono is None:
+                    first_frame_receive_mono = receive_mono
+                if last_frame_receive_mono is not None:
+                    interval_ms = (receive_mono - last_frame_receive_mono) * 1000.0
+                    previous_ms = ws_debug.get("input_interval_ms")
+                    ws_debug["input_interval_ms"] = (
+                        interval_ms if previous_ms is None
+                        else float(previous_ms) * 0.9 + interval_ms * 0.1
+                    )
+                last_frame_receive_mono = receive_mono
+                receive_elapsed = receive_mono - first_frame_receive_mono
+                if receive_elapsed > 0.0:
+                    ws_debug["input_fps"] = (frames_in - 1) / receive_elapsed
                 ws_debug["frames_in"] = frames_in
                 ws_debug["last_receive_at"] = time.time()
                 ws_debug["last_message_type"] = "frame_bytes"
@@ -1506,6 +1932,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     return _decode_image(data)
 
                 def _run_frame():
+                    nonlocal person_monitor_future
+                    nonlocal person_monitor_last_chunk
+                    nonlocal person_monitor_last_submit_frame
+                    nonlocal person_monitor_next_at
+
                     if _prof_on:
                         _dec_t0 = time.perf_counter()
                         frame = _decode_uplink(frame_bytes)
@@ -1568,21 +1999,107 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                             return "__gate_pe__"
 
                     if (presence_monitor or count_monitor) and not face_gate_pending:
-                        if presence_monitor:
-                            stride = max(1, int(args.person_check_stride))
-                            _tick = gate_state.get("person_check_i", 0)
-                            if _tick == 0 or gate_state.get("absent_hold"):
-                                gate_state["person_last"] = _person_present(
-                                    frame, onnx_path=args.person_detector_onnx, conf=float(args.person_gate_conf))
+                        stride = max(1, int(args.person_check_stride))
+                        fresh_monitor_result: dict[str, Any] | None = None
 
-                                if face_required and gate_state["person_last"]:
-                                    gate_state["face_last"] = _face_present(
-                                        frame, onnx_path=args.face_detector_onnx, score_thresh=fg_score,
-                                        min_ratio=float(args.face_present_min_ratio),
-                                        edge_margin=float(args.face_present_edge_margin))
+                        # Never wait for the detector on the receive/ACK path.
+                        # A same-GPU detector can legitimately wait behind a
+                        # compiled video graph; blocking here used to stop new
+                        # frames from reaching the next 8-frame chunk.
+                        if person_monitor_future is not None and person_monitor_future.done():
+                            try:
+                                candidate = person_monitor_future.result()
+                                if int(candidate.get("epoch", -1)) == person_monitor_epoch:
+                                    fresh_monitor_result = candidate
+                                    ws_debug["person_monitor_completed"] = int(
+                                        ws_debug.get("person_monitor_completed", 0)
+                                    ) + 1
+                                    ws_debug["person_monitor_ms"] = float(
+                                        candidate.get("elapsed_ms", 0.0)
+                                    )
+                                    ws_debug["person_monitor_state"] = "idle"
+                            except Exception as exc:
+                                # Continuous monitoring is a safety feature, so
+                                # a detector failure remains fail-open instead
+                                # of terminating an otherwise healthy stream.
+                                ws_debug["person_monitor_error"] = repr(exc)
+                                ws_debug["person_monitor_state"] = "error"
+                                print(
+                                    f"#####[PERSON-GATE] async monitor failed ({exc!r}) -> fail-open",
+                                    flush=True,
+                                )
+                            finally:
+                                person_monitor_future = None
+
+                        if fresh_monitor_result is not None:
+                            gate_state["person_last"] = bool(
+                                fresh_monitor_result.get("body_present", True)
+                            )
+                            gate_state["face_last"] = bool(
+                                fresh_monitor_result.get("face_present", True)
+                            )
+
+                            if count_monitor and fresh_monitor_result.get("face_count") is not None:
+                                _n = int(fresh_monitor_result["face_count"])
+                                sample_frames = stride
+                                if gate_state["subject_count"] is None:
+                                    gate_state["subject_count"] = _n
+                                    gate_state["cand"] = None
+                                    gate_state["cand_n"] = 0
+                                elif _n > gate_state["subject_count"]:
+                                    if _n == gate_state["cand"]:
+                                        gate_state["cand_n"] += sample_frames
+                                    else:
+                                        gate_state["cand"] = _n
+                                        gate_state["cand_n"] = sample_frames
+                                    if gate_state["cand_n"] >= int(args.person_count_change_frames):
+                                        gate_state["recount"] = True
+                                        gate_state["subject_count"] = _n
+                                        gate_state["cand"] = None
+                                        gate_state["cand_n"] = 0
+                                elif _n < gate_state["subject_count"]:
+                                    if _n == gate_state["cand"]:
+                                        gate_state["cand_n"] += sample_frames
+                                    else:
+                                        gate_state["cand"] = _n
+                                        gate_state["cand_n"] = sample_frames
+                                    if gate_state["cand_n"] >= int(args.person_count_change_frames):
+                                        gate_state["subject_count"] = _n
+                                        gate_state["cand"] = None
+                                        gate_state["cand_n"] = 0
                                 else:
-                                    gate_state["face_last"] = True
-                            gate_state["person_check_i"] = (_tick + 1) % stride
+                                    gate_state["cand"] = None
+                                    gate_state["cand_n"] = 0
+
+                        now_mono = time.monotonic()
+                        completed_chunks = int(ws_debug.get("chunk_results_sent", 0))
+                        chunk_ready = (
+                            completed_chunks > person_monitor_last_chunk
+                            and frames_in - person_monitor_last_submit_frame >= stride
+                        )
+                        hold_ready = (
+                            bool(gate_state.get("absent_hold"))
+                            and now_mono >= person_monitor_next_at
+                        )
+                        if person_monitor_future is None and (chunk_ready or hold_ready):
+                            monitor_frame = frame.copy()
+                            person_monitor_future = person_monitor_pool.submit(
+                                _run_person_monitor,
+                                monitor_frame,
+                                person_monitor_epoch,
+                                monitor_presence=presence_monitor,
+                                monitor_face=face_required,
+                                monitor_count=count_monitor,
+                            )
+                            person_monitor_last_chunk = completed_chunks
+                            person_monitor_last_submit_frame = frames_in
+                            person_monitor_next_at = now_mono + stride / 24.0
+                            ws_debug["person_monitor_submitted"] = int(
+                                ws_debug.get("person_monitor_submitted", 0)
+                            ) + 1
+                            ws_debug["person_monitor_state"] = "running"
+
+                        if presence_monitor:
                             _body_here = bool(gate_state["person_last"])
                             _face_here = bool(gate_state.get("face_last", True))
                             _present = _body_here and _face_here
@@ -1623,41 +2140,6 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                             if gate_state.get("absent_hold"):
                                 return ("__no_person__", gate_state.get("hold_reason", "no_person"))
 
-                        if count_monitor:
-                            _reason_c, _, _n_faces = _check_face_gate(
-                                frame, onnx_path=args.face_detector_onnx,
-                                score_thresh=fg_score, min_below_ratio=fg_min_below,
-                                count_min_ratio=float(args.count_face_min_ratio))
-                            _n = _n_faces
-                            if gate_state["subject_count"] is None:
-                                gate_state["subject_count"] = _n
-                                gate_state["cand"] = None
-                                gate_state["cand_n"] = 0
-                            elif _n > gate_state["subject_count"]:
-                                if _n == gate_state["cand"]:
-                                    gate_state["cand_n"] += 1
-                                else:
-                                    gate_state["cand"] = _n
-                                    gate_state["cand_n"] = 1
-                                if gate_state["cand_n"] >= int(args.person_count_change_frames):
-                                    gate_state["recount"] = True
-                                    gate_state["subject_count"] = _n
-                                    gate_state["cand"] = None
-                                    gate_state["cand_n"] = 0
-                            elif _n < gate_state["subject_count"]:
-                                if _n == gate_state["cand"]:
-                                    gate_state["cand_n"] += 1
-                                else:
-                                    gate_state["cand"] = _n
-                                    gate_state["cand_n"] = 1
-                                if gate_state["cand_n"] >= int(args.person_count_change_frames):
-                                    gate_state["subject_count"] = _n
-                                    gate_state["cand"] = None
-                                    gate_state["cand_n"] = 0
-                            else:
-                                gate_state["cand"] = None
-                                gate_state["cand_n"] = 0
-
                     if pe_defer and not face_gate_pending:
                         gate_state["pe_anchor"] = frame
                         return "__gate_pe__"
@@ -1683,14 +2165,22 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                             _rec_i.submit(frame)
                             ws_debug["rec_in_written"] = _rec_i.frames_written
                             ws_debug["rec_in_dropped"] = _rec_i.frames_dropped_recording
-                        return session.push_frame(frame, frame_meta=frame_meta)
+                        # The output pump is the sole consumer of the async
+                        # result queue.  Draining here as well lets adjacent
+                        # chunks race through the same stateful H.264 encoder,
+                        # which can reorder PTS and interleave wire messages.
+                        return session.push_frame(
+                            frame,
+                            frame_meta=frame_meta,
+                            drain_results=False,
+                        )
                     finally:
                         app.state.inference_lock.release()
 
                 started = time.time()
                 try:
                     chunk_results = await asyncio.wait_for(
-                        asyncio.to_thread(_run_frame),
+                        loop.run_in_executor(app.state.frame_executor, _run_frame),
                         timeout=max(0.1, float(args.push_frame_timeout_s)),
                     )
                 except asyncio.TimeoutError:
@@ -1701,6 +2191,12 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 except Exception as exc:
                     await _send_json({"type": "error", "message": repr(exc)})
                     break
+                frame_process_ms = (time.time() - started) * 1000.0
+                previous_process_ms = ws_debug.get("frame_process_ms")
+                ws_debug["frame_process_ms"] = (
+                    frame_process_ms if previous_process_ms is None
+                    else float(previous_process_ms) * 0.9 + frame_process_ms * 0.1
+                )
                 if chunk_results is None:
                     continue
                 if isinstance(chunk_results, tuple) and chunk_results and isinstance(chunk_results[0], str):
@@ -1810,6 +2306,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 raise
         finally:
             try:
+                await _stop_person_monitor()
                 await _stop_output_task()
                 _final_rec = rec_base
                 await asyncio.to_thread(_stop_recorders)
@@ -1825,6 +2322,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 if downlink_encoder is not None:
                     downlink_encoder.close()
                     downlink_encoder = None
+                if rocprof_region_active:
+                    _rocprof_selected_region(resume=False)
+                    rocprof_region_active = False
                 ws_debug["closed_at"] = time.time()
                 ws_debug["send_state"] = "closed"
             finally:
@@ -1871,9 +2371,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count-face-min-ratio", type=float, default=0.45, help="For person-count-change: a face counts as an additional subject only if its short side is >= this fraction of the MAIN (largest/foreground) face's short side. Excludes far-smaller BACKGROUND people (e.g. a coworker behind the subject) that otherwise flip the count and trigger spurious re-edits. Higher = stricter (ignore more background). Default 0.45.")
     parser.add_argument("--person-count-reedit", action=argparse.BooleanOptionalAction, default=True, help="Re-edit (reset chunk0) when the head count changes -- ALL modes incl. style. --no-person-count-reedit to disable.")
     parser.add_argument("--require-face", action=argparse.BooleanOptionalAction, default=True, help="Also black-hold when a body is present but NO face is detected (hand over face / turned away). --no-require-face to only gate on body.")
-    parser.add_argument("--person-detector-onnx", type=str, default=DEFAULT_PERSON_DETECTOR_ONNX, help="YOLOv8n ONNX (fixed 320) for mid-session person presence via cv2.dnn. Missing -> passthrough disabled (edits always run).")
+    parser.add_argument("--person-detector-pt", type=str, default=DEFAULT_PERSON_DETECTOR_PT, help="Native YOLOv8n PyTorch weight for accelerated person presence. Preferred over ONNX when present.")
+    parser.add_argument("--person-detector-compile", type=str, default="max-autotune-no-cudagraphs", help="torch.compile mode for native YOLO; pass an empty string to disable.")
+    parser.add_argument("--person-detector-onnx", type=str, default=DEFAULT_PERSON_DETECTOR_ONNX, help="Fixed-320 YOLOv8n ONNX fallback for cv2.dnn. Missing or incompatible -> person monitoring fails open.")
     parser.add_argument("--person-gate-conf", type=float, default=0.4, help="Min YOLO person-class score to count the person as present.")
-    parser.add_argument("--person-check-stride", type=int, default=2, help="Run the person detector every Nth frame during editing (YOLO ~27ms; stride amortizes the cost). Smaller = faster stop/resume detection, more CPU.")
+    parser.add_argument(
+        "--person-check-stride",
+        type=int,
+        default=8,
+        help=(
+            "Run continuous person/face/count monitoring every Nth frame during editing "
+            "(default: 8, or 3 Hz at 24 fps). The startup face gate remains per-frame."
+        ),
+    )
     parser.add_argument("--person-body-flip-frames", type=int, default=6, help="Consecutive body-misses before the client reason flips to no_person. Below this, a lone YOLO dip (a hand/object over the face also clips the torso) keeps the current reason -- normally show_full_face -- so the hint doesn't strobe no_face<->no_person. Reason-only de-bounce; the black-hold timing (--presence-absent-frames) is unaffected. ~24fps, 6 ≈ 0.25s. Higher = more reluctant to ever show no_person; 1 = report no_person on the first miss (old behavior).")
     parser.add_argument("--output-quality", type=int, default=60)
     parser.add_argument("--uplink-codec", type=str, default="auto", choices=["auto", "jpeg"],
@@ -1889,7 +2399,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freeze-kv-on-static", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--static-diff-thresh", type=float, default=0.5)
     parser.add_argument("--preload", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--push-frame-timeout-s", type=float, default=15.0, help="Max seconds a single frame submission may block before releasing the WS session gate.")
+    parser.add_argument("--push-frame-timeout-s", type=float, default=60.0, help="Max seconds a single frame submission may block before releasing the WS session gate. The default covers one-time ROCm graph specialization; steady-state submissions remain sub-second.")
     parser.add_argument("--session-close-timeout-s", type=float, default=5.0, help="Best-effort session cleanup timeout during WS teardown.")
     parser.add_argument("--inference-lock-timeout-s", type=float, default=5.0, help="Max seconds to wait for the process-wide inference lock.")
 
@@ -1906,6 +2416,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    _configure_rocm_tunableop()
     app = create_app(args)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info", ws_max_size=32 * 1024 * 1024)
 

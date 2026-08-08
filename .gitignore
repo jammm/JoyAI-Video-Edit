@@ -6,17 +6,25 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .ipynb_checkpoints/
+.pytest_cache/
+.venv/
+venv/
 
 # joyomni_ops native build artifacts (built from source; never commit binaries)
 joyomni_ops/build/
+joyomni_ops/csrc/*.hip
+!joyomni_ops/csrc/per_token_quant_fp8_rocm.hip
+joyomni_ops/include/*_hip.h
 *.so
 
 # OS / editor
 .DS_Store
 
-# Runtime artifacts (recordings, server logs)
+# Runtime artifacts (recordings, profiles, server logs)
 deploy/recordings/
+profiles/
 deploy/server.log
+*.log
 
 # Local secrets / machine-specific launch settings
 .env

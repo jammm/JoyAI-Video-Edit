@@ -40,6 +40,7 @@ class FlowMatchDiscreteScheduler(SchedulerMixin, ConfigMixin):
             sigmas[:-1] * num_train_timesteps).to(dtype=torch.float32)
 
         self._step_index = None
+        self._schedule_cache = {}
 
         self.supported_solver = ["euler"]
         if solver not in self.supported_solver:
@@ -57,17 +58,27 @@ class FlowMatchDiscreteScheduler(SchedulerMixin, ConfigMixin):
         device: Union[str, torch.device] = None,
     ):
         self.num_inference_steps = num_inference_steps
+        device_obj = torch.device(device) if device is not None else torch.device("cpu")
+        cache_key = (int(num_inference_steps), device_obj)
+        cached = self._schedule_cache.get(cache_key)
+        if cached is None:
+            sigmas = torch.linspace(
+                1,
+                0,
+                num_inference_steps + 1,
+                device=device_obj,
+                dtype=torch.float32,
+            )
+            sigmas = self.sd3_time_shift(sigmas)
 
-        sigmas = torch.linspace(1, 0, num_inference_steps + 1)
-        sigmas = self.sd3_time_shift(sigmas)
+            if not self.config.reverse:
+                sigmas = 1 - sigmas
 
-        if not self.config.reverse:
-            sigmas = 1 - sigmas
+            timesteps = sigmas[:-1] * self.config.num_train_timesteps
+            cached = (sigmas, timesteps)
+            self._schedule_cache[cache_key] = cached
 
-        self.sigmas = sigmas
-        self.timesteps = (sigmas[:-1] * self.config.num_train_timesteps).to(
-            dtype=torch.float32, device=device
-        )
+        self.sigmas, self.timesteps = cached
 
         self._step_index = None
 
@@ -84,6 +95,16 @@ class FlowMatchDiscreteScheduler(SchedulerMixin, ConfigMixin):
     def _init_step_index(self, timestep):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.to(self.timesteps.device)
+            # The streaming caller iterates this exact schedule from the first
+            # element on every chunk. Detect that zero-dimensional view using
+            # tensor metadata and avoid a GPU nonzero()+item() synchronization.
+            if (
+                timestep.numel() == 1 and
+                timestep.untyped_storage().data_ptr() == self.timesteps.untyped_storage().data_ptr() and
+                timestep.storage_offset() == self.timesteps.storage_offset()
+            ):
+                self._step_index = 0
+                return
         self._step_index = self.index_for_timestep(timestep)
 
     def sd3_time_shift(self, t: torch.Tensor):

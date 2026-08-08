@@ -1,0 +1,35 @@
+# Accelerator packages are intentionally not pinned here. Install a matching
+# ROCm or TheRock framework stack first, then install these application-only
+# dependencies. Do not use the CUDA-oriented requirements.txt in that env.
+
+transformers==4.57.0
+diffusers==0.36.0
+accelerate==1.10.1
+huggingface-hub==0.36.2
+safetensors==0.7.0
+tokenizers==0.22.2
+sentencepiece==0.2.0
+protobuf==7.34.1
+
+fastapi==0.117.1
+uvicorn==0.37.0
+starlette==0.48.0
+pydantic==2.10.6
+python-multipart==0.0.24
+websockets==16.0
+requests==2.33.1
+aiohttp==3.13.5
+
+numpy==2.2.6
+pillow==12.2.0
+opencv-python==5.0.0.93
+ultralytics==8.4.116
+av==13.1.0
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+# The only PyPI decord 0.6.0 Linux wheel declares a CPython 3.6 ABI and pip
+# 26 correctly rejects it on Python 3.12.  Nothing in this repository imports
+# decord; streaming video input/output uses PyAV instead.
+einops==0.8.2
+tqdm==4.67.3
+loguru==0.7.3

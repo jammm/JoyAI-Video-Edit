@@ -44,6 +44,12 @@ class Pipeline(DiffusionPipeline):
 
         self.image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor)
+        # Latent normalization runs for every streaming encode and decode.
+        # Keep the immutable statistics on each active device/dtype instead of
+        # rebuilding CPU tensors and copying them to the accelerator per chunk.
+        self._latent_stats_cache: Dict[
+            Tuple[torch.device, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
         text_encoder_ckpt = dict(args.text_encoder_arch_config.get("params", {}))['text_encoder_ckpt']
         self.qwen_processor = AutoProcessor.from_pretrained(text_encoder_ckpt, use_fast=True)
@@ -234,12 +240,27 @@ class Pipeline(DiffusionPipeline):
 
         return prompt_embeds, prompt_embeds_mask
 
+    def _latent_stats(self, latent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = (latent.device, latent.dtype)
+        cached = self._latent_stats_cache.get(key)
+        if cached is None:
+            mean = torch.as_tensor(
+                self.vae.config.latents_mean,
+                device=latent.device,
+                dtype=latent.dtype,
+            ).view(1, -1, 1, 1, 1)
+            std = torch.as_tensor(
+                self.vae.config.latents_std,
+                device=latent.device,
+                dtype=latent.dtype,
+            ).view(1, -1, 1, 1, 1)
+            cached = (mean, std)
+            self._latent_stats_cache[key] = cached
+        return cached
+
     def normalize_latents(self, latent: torch.Tensor):
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean = torch.tensor(self.vae.config.latents_mean).view(
-                1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
-            latents_std = torch.tensor(self.vae.config.latents_std).view(
-                1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
+            latents_mean, latents_std = self._latent_stats(latent)
             latent = (latent - latents_mean) / latents_std
         else:
             latent = latent * self.vae.config.scaling_factor
@@ -247,10 +268,7 @@ class Pipeline(DiffusionPipeline):
 
     def denormalize_latents(self, latent: torch.Tensor):
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean = torch.tensor(self.vae.config.latents_mean).view(
-                1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
-            latents_std = torch.tensor(self.vae.config.latents_std).view(
-                1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
+            latents_mean, latents_std = self._latent_stats(latent)
             latent = latent * latents_std + latents_mean
         else:
             latent = latent / self.vae.config.scaling_factor
@@ -261,6 +279,7 @@ class Pipeline(DiffusionPipeline):
         inputs: torch.Tensor,
         *,
         enable_denormalization: bool,
+        last_only: bool = False,
     ) -> torch.Tensor:
         is_causal = getattr(self.transformer.config, "causal", False)
         dit_chunk_size = getattr(self.transformer.config, "chunk_size", None)
@@ -279,6 +298,18 @@ class Pipeline(DiffusionPipeline):
             window_frames = 1 + window_pixels
             stride = ffactor_t
             num_latents = (total_t - 1) // stride + 1
+
+            # Online streaming supplies exactly one causal VAE window and only
+            # consumes its newest latent. The generic loop below encodes the
+            # first frame once on its own and then encodes it again as part of
+            # the full window. XVAE already performs the causal chunking inside
+            # a single encode call, so skip that duplicate encoder pass.
+            if last_only and total_t <= window_frames:
+                h = self._encode_vae_single(
+                    inputs,
+                    enable_denormalization=enable_denormalization,
+                )
+                return h[:, :, -1:]
 
             lat_list = []
             for k in range(num_latents):
@@ -419,6 +450,7 @@ class Pipeline(DiffusionPipeline):
                 kv_cache_selected_chunk_ids=[],
                 self_attn_input_mode=SELF_ATTN_MODE_REF_IMAGE_CACHE,
                 skip_text_stream=True,
+                kv_cache_store_prefix_layers=len(model.double_blocks),
             )
 
     def _store_clean_chunk_kv_cache(
@@ -434,6 +466,7 @@ class Pipeline(DiffusionPipeline):
         pre_rope: bool = False,
         cached_temporal_ids: Optional[torch.Tensor] = None,
         store_mode: str = "store",
+        store_prefix_layers: Optional[int] = None,
     ) -> None:
         if store_mode not in ("store", "reuse_store"):
             raise ValueError(f"`store_mode` must be 'store' or 'reuse_store', got {store_mode!r}.")
@@ -460,6 +493,11 @@ class Pipeline(DiffusionPipeline):
                 kv_cache_selected_chunk_ids=selected_chunk_ids,
                 kv_cache_pre_rope=pre_rope,
                 skip_text_stream=True,
+                kv_cache_store_prefix_layers=(
+                    len(model.double_blocks)
+                    if store_prefix_layers is None
+                    else int(store_prefix_layers)
+                ),
             )
 
     def _resolve_streaming_chunk_size(self, explicit_chunk_size: Optional[int], total_latent_frames: int) -> int:

@@ -22,6 +22,91 @@
 namespace joyomni_ops {
 namespace {
 
+#if defined(__HIP_PLATFORM_AMD__)
+
+__inline__ __device__ float warpReduceSum(float val) {
+#pragma unroll
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    // Every lane consumes the norm below, so broadcast the complete wave sum
+    // to every lane.  A down-shuffle only leaves the full result in lane 0.
+    val += __shfl_xor(val, offset);
+  return val;
+}
+
+template <typename T>
+inline __device__ __host__ T divUp(T m, T n) {
+  return (m + n - 1) / n;
+}
+
+// gfx950 uses wave64. One wave owns the matching Q and K head together; lanes
+// operate on RoPE pairs. Pairing Q/K halves wave scheduling and reuses each
+// cos/sin load while keeping the two independent reductions in flight.
+template <int head_dim>
+__global__ void fusedQKNormRope3DPaired(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    int const batch_size,
+    int const seq_len,
+    int const num_heads,
+    float const eps,
+    __nv_bfloat16 const* __restrict__ q_weight,
+    __nv_bfloat16 const* __restrict__ k_weight,
+    __nv_bfloat16 const* __restrict__ cos_ptr,
+    __nv_bfloat16 const* __restrict__ sin_ptr,
+    __nv_bfloat16* __restrict__ k_pre_rope) {
+  const int waves_per_block = blockDim.x / warpSize;
+  const int wave_id = threadIdx.x / warpSize;
+  const int lane_id = threadIdx.x % warpSize;
+  const int global_wave_idx = blockIdx.x * waves_per_block + wave_id;
+  const int total_heads = batch_size * seq_len * num_heads;
+  if (global_wave_idx >= total_heads) return;
+
+  const int token_idx = (global_wave_idx % (seq_len * num_heads)) / num_heads;
+  const int head_offset = global_wave_idx * head_dim;
+  constexpr int pairs = head_dim / 2;
+
+  float q_sum_of_squares = 0.0f;
+  float k_sum_of_squares = 0.0f;
+  for (int pair = lane_id; pair < pairs; pair += warpSize) {
+    const int dim = pair * 2;
+    const float q0 = static_cast<float>(q[head_offset + dim]);
+    const float q1 = static_cast<float>(q[head_offset + dim + 1]);
+    const float k0 = static_cast<float>(k[head_offset + dim]);
+    const float k1 = static_cast<float>(k[head_offset + dim + 1]);
+    q_sum_of_squares += q0 * q0 + q1 * q1;
+    k_sum_of_squares += k0 * k0 + k1 * k1;
+  }
+  q_sum_of_squares = warpReduceSum(q_sum_of_squares);
+  k_sum_of_squares = warpReduceSum(k_sum_of_squares);
+  const float q_rms_rcp = rsqrtf(q_sum_of_squares / static_cast<float>(head_dim) + eps);
+  const float k_rms_rcp = rsqrtf(k_sum_of_squares / static_cast<float>(head_dim) + eps);
+
+  const int cos_sin_row_offset = token_idx * pairs;
+  for (int pair = lane_id; pair < pairs; pair += warpSize) {
+    const int dim = pair * 2;
+    const float q0 = static_cast<float>(q[head_offset + dim]) * q_rms_rcp *
+                     static_cast<float>(q_weight[dim]);
+    const float q1 = static_cast<float>(q[head_offset + dim + 1]) * q_rms_rcp *
+                     static_cast<float>(q_weight[dim + 1]);
+    const float k0 = static_cast<float>(k[head_offset + dim]) * k_rms_rcp *
+                     static_cast<float>(k_weight[dim]);
+    const float k1 = static_cast<float>(k[head_offset + dim + 1]) * k_rms_rcp *
+                     static_cast<float>(k_weight[dim + 1]);
+    const float c = static_cast<float>(cos_ptr[cos_sin_row_offset + pair]);
+    const float s = static_cast<float>(sin_ptr[cos_sin_row_offset + pair]);
+    if (k_pre_rope != nullptr) {
+      k_pre_rope[head_offset + dim] = __nv_bfloat16(k0);
+      k_pre_rope[head_offset + dim + 1] = __nv_bfloat16(k1);
+    }
+    q[head_offset + dim] = __nv_bfloat16(q0 * c - q1 * s);
+    q[head_offset + dim + 1] = __nv_bfloat16(q0 * s + q1 * c);
+    k[head_offset + dim] = __nv_bfloat16(k0 * c - k1 * s);
+    k[head_offset + dim + 1] = __nv_bfloat16(k0 * s + k1 * c);
+  }
+}
+
+#else
+
 constexpr unsigned kFullMask = 0xffffffffu;
 
 template <typename T, int num>
@@ -64,7 +149,8 @@ __global__ void fusedQKNormRope3DPaired(
     __nv_bfloat16 const* __restrict__ q_weight,
     __nv_bfloat16 const* __restrict__ k_weight,
     __nv_bfloat16 const* __restrict__ cos_ptr,
-    __nv_bfloat16 const* __restrict__ sin_ptr) {
+    __nv_bfloat16 const* __restrict__ sin_ptr,
+    __nv_bfloat16* __restrict__ k_pre_rope) {
   int const warpsPerBlock = blockDim.x / 32;
   int const warpId = threadIdx.x / 32;
   int const laneId = threadIdx.x % 32;
@@ -115,6 +201,9 @@ __global__ void fusedQKNormRope3DPaired(
   for (int i = 0; i < numElemsPerThread; i++) {
     int dim = laneId * numElemsPerThread + i;
     elements[i] *= rms_rcp * __bfloat162float(weight[dim]);
+    if (is_k && k_pre_rope != nullptr) {
+      k_pre_rope[offsetThread + i] = __nv_bfloat16(elements[i]);
+    }
   }
 
   int const cos_sin_row_offset = token_idx * (head_dim / 2);
@@ -142,13 +231,24 @@ __global__ void fusedQKNormRope3DPaired(
   }
 }
 
+#endif
+
 void launchPaired(
     void* q, void* k, int batch_size, int seq_len, int num_heads, int head_dim,
     float eps, void const* q_weight, void const* k_weight, void const* cos_ptr,
-    void const* sin_ptr, cudaStream_t stream) {
+    void const* sin_ptr, void* k_pre_rope, cudaStream_t stream) {
   constexpr int blockSize = 256;
-  int const warpsPerBlock = blockSize / 32;
+#if defined(__HIP_PLATFORM_AMD__)
+  constexpr int nativeWarpSize = 64;
+#else
+  constexpr int nativeWarpSize = 32;
+#endif
+  int const warpsPerBlock = blockSize / nativeWarpSize;
+#if defined(__HIP_PLATFORM_AMD__)
+  int const totalQKHeads = batch_size * seq_len * num_heads;
+#else
   int const totalQKHeads = batch_size * seq_len * num_heads * 2;
+#endif
   dim3 gridDim(divUp(totalQKHeads, warpsPerBlock));
   dim3 blockDim(blockSize);
   auto q16 = reinterpret_cast<__nv_bfloat16*>(q);
@@ -157,9 +257,10 @@ void launchPaired(
   auto kw = reinterpret_cast<__nv_bfloat16 const*>(k_weight);
   auto cs = reinterpret_cast<__nv_bfloat16 const*>(cos_ptr);
   auto sn = reinterpret_cast<__nv_bfloat16 const*>(sin_ptr);
+  auto k_cache = reinterpret_cast<__nv_bfloat16*>(k_pre_rope);
 #define LAUNCH(HD)                                                                            \
   fusedQKNormRope3DPaired<HD><<<gridDim, blockDim, 0, stream>>>(                              \
-      q16, k16, batch_size, seq_len, num_heads, eps, qw, kw, cs, sn);                         \
+      q16, k16, batch_size, seq_len, num_heads, eps, qw, kw, cs, sn, k_cache);                \
   break
   switch (head_dim) {
     case 64:
@@ -179,7 +280,8 @@ void launchPaired(
 void fused_qk_norm_rope_3d_paired(
     torch::Tensor& q, torch::Tensor& k, int64_t seq_len, int64_t num_heads,
     double eps, torch::Tensor& q_weight, torch::Tensor& k_weight,
-    torch::Tensor& cos, torch::Tensor& sin) {
+    torch::Tensor& cos, torch::Tensor& sin,
+    const c10::optional<torch::Tensor>& k_pre_rope_opt) {
   TORCH_CHECK(q.dim() == 3, "q must be 3D [batch, seq_len*num_heads, head_dim]");
   TORCH_CHECK(k.dim() == 3, "k must be 3D [batch, seq_len*num_heads, head_dim]");
   TORCH_CHECK(q.sizes() == k.sizes(), "q and k must have the same shape");
@@ -199,12 +301,21 @@ void fused_qk_norm_rope_3d_paired(
   TORCH_CHECK(cos.size(0) == seq_len && cos.size(1) == head_dim / 2, "cos shape must be [seq_len, head_dim/2]");
   TORCH_CHECK(sin.size(0) == seq_len && sin.size(1) == head_dim / 2, "sin shape must be [seq_len, head_dim/2]");
 
+  void* k_pre_rope = nullptr;
+  if (k_pre_rope_opt.has_value()) {
+    const auto& cache = k_pre_rope_opt.value();
+    TORCH_CHECK(cache.sizes() == k.sizes(), "k_pre_rope must have the same shape as k");
+    JO_CHECK_INPUT(cache, torch::kBFloat16);
+    k_pre_rope = cache.data_ptr();
+  }
+
   const c10::cuda::CUDAGuard guard(q.device());
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
   launchPaired(
       q.data_ptr(), k.data_ptr(), static_cast<int>(batch_size), static_cast<int>(seq_len),
       static_cast<int>(num_heads), static_cast<int>(head_dim), static_cast<float>(eps),
-      q_weight.data_ptr(), k_weight.data_ptr(), cos.data_ptr(), sin.data_ptr(), stream);
+      q_weight.data_ptr(), k_weight.data_ptr(), cos.data_ptr(), sin.data_ptr(), k_pre_rope,
+      stream);
 }
 
 }  // namespace joyomni_ops

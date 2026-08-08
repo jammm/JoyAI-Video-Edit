@@ -18,7 +18,12 @@ from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 
 
-from flash_attn.cute import flash_attn_func as _fa4_func
+try:
+    # flash-attn 4 currently exposes NVIDIA CuTe kernels only.  Keep it as an
+    # optional fast path on CUDA builds; ROCm uses PyTorch SDPA (AOTriton/CK).
+    from flash_attn.cute import flash_attn_func as _fa4_func
+except (ImportError, OSError):
+    _fa4_func = None
 
 
 SOURCE_ID_TARGET = 0.0
@@ -114,17 +119,36 @@ class ModulateWan(nn.Module):
 logger = logging.getLogger(__name__)
 
 
-def _clone_kv_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+def _retain_kv_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if tensor is None:
         return None
+    # K handed to the cache is a fresh contiguous block output and is never
+    # mutated after the writer returns, so retaining its detached storage is
+    # equivalent to cloning it and avoids one large D2D copy per layer.
+    return tensor.detach()
+
+
+def _compact_kv_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    # V is a stride-3 view into QKV.  Materialize it once: retaining that view
+    # keeps the 3x projection alive and makes every later cache assembly read
+    # scattered data, which is slower than this compact copy on gfx950.
     return tensor.detach().clone()
 
 
-_FA4_DISABLED = False
+_FA4_DISABLED = _fa4_func is None
+_IS_ROCM = torch.version.hip is not None
 
-# SM120 (Blackwell): cuDNN attention is ~10-20% faster than PyTorch's flash backend
-# here, so order it first. flash/efficient are fallbacks. (Benchmarked H=32 D=128 bf16.)
-_SDPA_BACKENDS = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+# SM120 (Blackwell): cuDNN attention is ~10-20% faster than PyTorch's flash
+# backend here. ROCm's default SDPA dispatcher selects its available
+# AOTriton/Composable Kernel backend and must not be constrained to cuDNN.
+_CUDA_SDPA_BACKENDS = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
 
 
 def _sdpa_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
@@ -132,8 +156,14 @@ def _sdpa_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor)
     q = query.transpose(1, 2)
     k = key.transpose(1, 2)
     v = value.transpose(1, 2)
-    with sdpa_kernel(_SDPA_BACKENDS):
+    if _IS_ROCM:
+        # Let ROCm PyTorch select between AOTriton, CK and the math fallback.
+        # Hard-coding the CUDA/cuDNN backend list can leave ROCm with no viable
+        # kernel, depending on the exact TheRock torch nightly.
         out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+    else:
+        with sdpa_kernel(_CUDA_SDPA_BACKENDS):
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
     return out.transpose(1, 2)
 
 
@@ -144,7 +174,7 @@ def _flash_attention4(query: torch.Tensor, key: torch.Tensor, value: torch.Tenso
         query = query.to(torch.bfloat16)
         key = key.to(torch.bfloat16)
         value = value.to(torch.bfloat16)
-    if not _FA4_DISABLED:
+    if not _FA4_DISABLED and _fa4_func is not None:
         try:
             out = _fa4_func(query, key, value, causal=False)
             if isinstance(out, tuple):
@@ -155,7 +185,7 @@ def _flash_attention4(query: torch.Tensor, key: torch.Tensor, value: torch.Tenso
             # nvidia-cutlass-dsl versions (see issue #4). Probe once, then fall
             # back to SDPA (still a fused flash/cuDNN kernel on sm100/sm120).
             _FA4_DISABLED = True
-            logger.warning(f"[{__name__}] FA4 unavailable, falling back to SDPA (flash/cuDNN): {exc!r}")
+            logger.warning(f"[{__name__}] FA4 unavailable, falling back to PyTorch SDPA: {exc!r}")
     return _sdpa_attention(query, key, value).to(original_dtype)
 
 
@@ -174,9 +204,13 @@ def warmup_attention_backend(
         k = torch.zeros(1, kv_len, heads_num, head_dim, device=device, dtype=dtype)
         _flash_attention4(q, k, k)
         torch.cuda.synchronize(device)
-        logger.warning(f"[{__name__}] FA4 warmup done (q={q_len}, kv={kv_len}, heads={heads_num}, dim={head_dim})")
+        backend = "ROCm SDPA" if _IS_ROCM else ("PyTorch SDPA" if _FA4_DISABLED else "FA4")
+        logger.warning(
+            f"[{__name__}] {backend} warmup done "
+            f"(q={q_len}, kv={kv_len}, heads={heads_num}, dim={head_dim})"
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[{__name__}] FA4 warmup failed (will lazily compile in-loop): {exc}")
+        logger.warning(f"[{__name__}] attention warmup failed (will initialize lazily): {exc}")
 
 
 def _concat_kv_entries(
@@ -186,9 +220,10 @@ def _concat_kv_entries(
     dtype: torch.dtype,
     cached_freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    keys = []
-    values = []
-    pre_rope_offset = 0
+    records = []
+    raw_keys = []
+    raw_values = []
+    all_pre_rope = True
 
     for entry in entries:
         if entry is None:
@@ -200,7 +235,29 @@ def _concat_kv_entries(
 
         key = key.to(device=device, dtype=dtype)
         value = value.to(device=device, dtype=dtype)
+        raw_keys.append(key)
+        raw_values.append(value)
+        all_pre_rope = all_pre_rope and bool(entry.get("pre_rope", False))
+        records.append((entry, key, value))
 
+    if not records:
+        return None, None
+
+    if (
+        cached_freqs_cis is not None
+        and len(raw_keys) <= 2
+        and all_pre_rope
+    ):
+        packed = _sgl_fused.fused_cached_kv_pack(
+            tuple(raw_keys), tuple(raw_values), cached_freqs_cis
+        )
+        if packed is not None:
+            return packed
+
+    keys = []
+    values = []
+    pre_rope_offset = 0
+    for entry, key, value in records:
         if entry.get("pre_rope", False) and cached_freqs_cis is not None:
             cos_all, sin_all = cached_freqs_cis
             seg_len = key.shape[1]
@@ -208,12 +265,8 @@ def _concat_kv_entries(
             sin_seg = sin_all[..., pre_rope_offset: pre_rope_offset + seg_len, :]
             key = apply_rotary_emb(key, (cos_seg, sin_seg))
             pre_rope_offset += seg_len
-
         keys.append(key)
         values.append(value)
-
-    if not keys:
-        return None, None
 
     return torch.cat(keys, dim=1), torch.cat(values, dim=1)
 
@@ -317,6 +370,8 @@ class MMDoubleStreamBlock(nn.Module):
         skip_text_stream: bool = False,
         kv_cache_pre_rope: bool = False,
         cached_freqs_cis: Optional[tuple] = None,
+        kv_cache_write_seq_len: Optional[int] = None,
+        kv_cache_write_only: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         _maybe_install_fp8_stream(self, "img")
         _fp8_on = _fp8_stream_enabled(self, "img")
@@ -351,17 +406,24 @@ class MMDoubleStreamBlock(nn.Module):
         img_q, img_k, img_v = rearrange(
             img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
         )
-        if kv_cache_pre_rope:
-            img_k_for_cache = _sgl_fused.rmsnorm_qk_bf16(
-                img_k, self.img_attn_k_norm.weight, eps=self.img_attn_k_norm.eps
+        img_k_for_cache = None
+        if kv_cache_pre_rope and kv_cache_writer is not None:
+            img_q, img_k, img_k_for_cache = _sgl_fused.fused_qk_norm_rope_3d(
+                img_q, img_k,
+                q_norm_weight=self.img_attn_q_norm.weight,
+                k_norm_weight=self.img_attn_k_norm.weight,
+                freqs_cis=vis_freqs_cis,
+                eps=self.img_attn_q_norm.eps,
+                return_k_pre_rope=True,
             )
-        img_q, img_k = _sgl_fused.fused_qk_norm_rope_3d(
-            img_q, img_k,
-            q_norm_weight=self.img_attn_q_norm.weight,
-            k_norm_weight=self.img_attn_k_norm.weight,
-            freqs_cis=vis_freqs_cis,
-            eps=self.img_attn_q_norm.eps,
-        )
+        else:
+            img_q, img_k = _sgl_fused.fused_qk_norm_rope_3d(
+                img_q, img_k,
+                q_norm_weight=self.img_attn_q_norm.weight,
+                k_norm_weight=self.img_attn_k_norm.weight,
+                freqs_cis=vis_freqs_cis,
+                eps=self.img_attn_q_norm.eps,
+            )
         if not kv_cache_pre_rope:
             img_k_for_cache = img_k
 
@@ -376,41 +438,52 @@ class MMDoubleStreamBlock(nn.Module):
             txt_q, txt_k, txt_v = rearrange(
                 txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
             )
-            txt_q = self.txt_attn_q_norm(txt_q).to(txt_v)
-            txt_k = self.txt_attn_k_norm(txt_k).to(txt_v)
-
-        if skip_text_stream:
-            q = img_q
-            k = img_k
-            v = img_v
-        else:
-            q = torch.cat((img_q, txt_q), dim=1)
-            k = torch.cat((img_k, txt_k), dim=1)
-            v = torch.cat((img_v, txt_v), dim=1)
 
         if kv_cache_writer is not None:
-            kv_cache_writer(layer_idx, img_k_for_cache, img_v)
+            cache_key = img_k_for_cache
+            cache_value = img_v
+            if kv_cache_write_seq_len is not None:
+                cache_key = cache_key[:, :kv_cache_write_seq_len]
+                cache_value = cache_value[:, :kv_cache_write_seq_len]
+            kv_cache_writer(layer_idx, cache_key, cache_value)
+            if kv_cache_write_only:
+                # Cache-only forwards do not consume this block's output once
+                # the final requested layer has written its K/V tensors.
+                return img, txt
 
         if kv_cache_assembler is not None:
             cached_key, cached_value = kv_cache_assembler(
                 layer_idx,
-                device=q.device,
-                dtype=q.dtype,
+                device=img_q.device,
+                dtype=img_q.dtype,
                 cached_freqs_cis=cached_freqs_cis if kv_cache_pre_rope else None,
             )
         elif kv_cache_reader is not None:
             cached_key, cached_value = _concat_kv_entries(
                 kv_cache_reader(layer_idx),
-                device=q.device,
-                dtype=q.dtype,
+                device=img_q.device,
+                dtype=img_q.dtype,
                 cached_freqs_cis=cached_freqs_cis if kv_cache_pre_rope else None,
             )
         else:
             cached_key = cached_value = None
 
-        if cached_key is not None:
-            k = torch.cat([cached_key, k], dim=1)
-            v = torch.cat([cached_value, v], dim=1)
+        if skip_text_stream:
+            q = img_q
+            k = img_k
+            v = img_v
+            if cached_key is not None:
+                k = torch.cat([cached_key, k], dim=1)
+                v = torch.cat([cached_value, v], dim=1)
+        else:
+            q, k, v = _sgl_fused.fused_joint_qkv_pack(
+                img_q, img_k, img_v,
+                txt_q, txt_k, txt_v,
+                cached_key, cached_value,
+                self.txt_attn_q_norm.weight,
+                self.txt_attn_k_norm.weight,
+                self.txt_attn_q_norm.eps,
+            )
 
         attn = _flash_attention4(q, k, v)
         attn = attn.flatten(2, 3)
@@ -494,6 +567,28 @@ class WanTimeTextImageEmbedding(nn.Module):
         self.time_proj = nn.Linear(dim, time_proj_dim)
         self.text_embedder = PixArtAlphaTextProjection(
             text_embed_dim, dim, act_fn="gelu_tanh")
+        self._inference_text_cache_key = None
+        self._inference_text_cache = None
+
+    @staticmethod
+    def _tensor_cache_key(tensor: torch.Tensor) -> tuple:
+        return (
+            id(tensor),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            int(tensor.storage_offset()),
+            int(tensor.untyped_storage().data_ptr()),
+            int(tensor._version),
+        )
+
+    def _project_text(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.training or torch.is_grad_enabled():
+            return self.text_embedder(encoder_hidden_states)
+        key = self._tensor_cache_key(encoder_hidden_states)
+        if key != self._inference_text_cache_key:
+            self._inference_text_cache = self.text_embedder(encoder_hidden_states)
+            self._inference_text_cache_key = key
+        return self._inference_text_cache
 
     def forward(
         self,   
@@ -514,7 +609,7 @@ class WanTimeTextImageEmbedding(nn.Module):
         if timestep_is_sequence:
             timestep_proj = timestep_proj.reshape(*timestep_shape, timestep_proj.shape[-1])
 
-        encoder_hidden_states = self.text_embedder(encoder_hidden_states)
+        encoder_hidden_states = self._project_text(encoder_hidden_states)
 
         return timestep_proj, encoder_hidden_states
 
@@ -719,8 +814,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             return
         chunk_store = scope_store.setdefault(self._kv_cache_chunk_id, {})
         chunk_store[layer_idx] = {
-            "key": _clone_kv_tensor(key),
-            "value": _clone_kv_tensor(value),
+            "key": _retain_kv_tensor(key),
+            "value": _compact_kv_tensor(value),
             "pre_rope": bool(self._kv_cache_pre_rope),
         }
         self._kv_cache_generation += 1
@@ -846,6 +941,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         kv_cache_pre_rope: bool = False,
         self_attn_input_mode: Optional[str] = None,
         skip_text_stream: bool = False,
+        kv_cache_store_current_only: bool = False,
+        kv_cache_store_prefix_layers: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         self._ensure_kv_cache_state()
@@ -856,6 +953,15 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             selected_chunk_ids=kv_cache_selected_chunk_ids,
             pre_rope=kv_cache_pre_rope,
         )
+        if kv_cache_store_prefix_layers is not None:
+            kv_cache_store_prefix_layers = int(kv_cache_store_prefix_layers)
+            if kv_cache_mode not in {"store", "reuse_store"}:
+                raise ValueError("`kv_cache_store_prefix_layers` requires a cache store mode.")
+            if not 1 <= kv_cache_store_prefix_layers <= len(self.double_blocks):
+                raise ValueError(
+                    "`kv_cache_store_prefix_layers` must be between 1 and "
+                    f"{len(self.double_blocks)}, got {kv_cache_store_prefix_layers}."
+                )
 
         batch_size = hidden_states.shape[0]
         patch_size = tuple(self.patch_size)
@@ -863,10 +969,10 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         current_seq_len = math.prod(current_patch_shape)
         device = hidden_states.device
 
-        encoder_hidden_states_mask = encoder_hidden_states_mask.to(
-            device=encoder_hidden_states.device,
-            dtype=torch.bool,
-        )
+        # The checkpoint's joint-attention architecture consumes the dense
+        # prompt sequence and does not apply this mask in the DiT. Avoid a
+        # redundant dtype conversion on every denoise/store forward.
+        _ = encoder_hidden_states_mask
 
         hidden_tokens = self.img_in(hidden_states).flatten(2).transpose(1, 2)
         temporal_ids = None
@@ -933,6 +1039,14 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         new_sin = sin_3d * cos_role + cos_3d * sin_role
         vis_freqs_cis = (new_cos, new_sin)
 
+        # The same RoPE is consumed by all 40 blocks. Pack/cast it once here;
+        # the old wrapper repeated both copies in every block.
+        vis_freqs_cis = _sgl_fused.prepare_fused_rope(
+            vis_freqs_cis,
+            head_dim=head_dim,
+            device=device,
+        )
+
         vec, txt = self.condition_embedder(timestep, encoder_hidden_states)
         vec = vec.unflatten(-1, (NUM_MODULATION_CHUNKS, -1))
 
@@ -942,7 +1056,20 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         _assembly_stamp = None
         if use_memo:
             _cached_ids_t = torch.as_tensor(cached_temporal_ids, device=device, dtype=torch.long)
-            _temporal_sig = (tuple(_cached_ids_t.shape), tuple(_cached_ids_t.reshape(-1).tolist()))
+            # Do not materialize GPU IDs as a Python list here.  This executes
+            # once per denoise forward, and `.tolist()` forced a full device
+            # synchronization between the two streaming inference steps.  A
+            # tensor's identity/storage metadata plus mutation version is an
+            # exact memo key while the caller reuses the same view; a new view
+            # or in-place update naturally invalidates it without a D2H read.
+            _temporal_sig = (
+                id(_cached_ids_t),
+                tuple(_cached_ids_t.shape),
+                tuple(_cached_ids_t.stride()),
+                int(_cached_ids_t.storage_offset()),
+                int(_cached_ids_t.untyped_storage().data_ptr()),
+                int(_cached_ids_t._version),
+            )
             _assembly_stamp = (
                 self._kv_cache_scope,
                 tuple(self._kv_cache_selected_chunk_ids or ()),
@@ -975,6 +1102,10 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 self._kv_assembly_cache = {}
 
         for layer_idx, block in enumerate(self.double_blocks):
+            cache_prefix_last_layer = (
+                kv_cache_store_prefix_layers is not None
+                and layer_idx + 1 == kv_cache_store_prefix_layers
+            )
             img, txt = block(
                 img,
                 txt,
@@ -987,7 +1118,13 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 skip_text_stream=skip_text_stream,
                 kv_cache_pre_rope=kv_cache_pre_rope,
                 cached_freqs_cis=cached_freqs_cis,
+                kv_cache_write_seq_len=current_seq_len if kv_cache_store_current_only else None,
+                kv_cache_write_only=cache_prefix_last_layer,
             )
+            if cache_prefix_last_layer:
+                # The caller requested cache material only. Avoid all remaining
+                # blocks plus the output projection/unpatchify path.
+                return (hidden_states, txt)
 
         img = self.proj_out(self.norm_out(img))
 

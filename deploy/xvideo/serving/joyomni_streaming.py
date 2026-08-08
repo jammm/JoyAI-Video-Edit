@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -30,7 +31,12 @@ def _autocast_ctx(device_type: str, dtype: torch.dtype, enabled: bool):
 
 _FULL_WARMUP_CHUNKS = 8
 
-_JPEG_CV2_QUALITY = 60
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in {"0", "false", "no", "off"}
 
 def _vae_compile_module():
     from xvideo.models.vae import vae_compile as module
@@ -40,6 +46,17 @@ def _vae_compile_module():
 class _ProfileTimer:
     wall_start: float
     start_event: torch.cuda.Event | None = None
+    device: torch.device | None = None
+
+
+@dataclass(frozen=True)
+class _PendingCudaTimer:
+    key: str
+    start_event: torch.cuda.Event
+    end_event: torch.cuda.Event
+
+
+_PENDING_CUDA_TIMERS_KEY = "_pending_cuda_timers"
 
 def _profile_timer_start(
     device: torch.device | str | None = None,
@@ -53,17 +70,11 @@ def _profile_timer_start(
         return _ProfileTimer(wall_start=time.perf_counter())
     start_event = torch.cuda.Event(enable_timing=True)
     start_event.record(torch.cuda.current_stream(device_obj))
-    return _ProfileTimer(wall_start=time.perf_counter(), start_event=start_event)
-
-def _profile_timer_elapsed(started: _ProfileTimer | float) -> float:
-    if isinstance(started, _ProfileTimer):
-        if started.start_event is not None:
-            end_event = torch.cuda.Event(enable_timing=True)
-            end_event.record()
-            end_event.synchronize()
-            return float(started.start_event.elapsed_time(end_event)) / 1000.0
-        return time.perf_counter() - started.wall_start
-    return time.perf_counter() - float(started)
+    return _ProfileTimer(
+        wall_start=time.perf_counter(),
+        start_event=start_event,
+        device=device_obj,
+    )
 
 @dataclass(frozen=True)
 class StreamingSettings:
@@ -78,6 +89,8 @@ class StreamingSettings:
     freeze_kv_on_static: bool = False
     static_diff_thresh: float = 2.0
     store_clean_self_only: bool = True
+    cache_last_denoise_kv: bool | None = None
+    clean_kv_prefix_layers: int | None = None
     profile_timings: bool = False
 
 @dataclass
@@ -104,16 +117,19 @@ class _ChunkJob:
 class _EncodedChunk:
     job: _ChunkJob
     ref_chunk_latent: torch.Tensor
+    ready_event: torch.cuda.Event | None = None
 
 @dataclass
 class _DenoisedChunk:
     job: _ChunkJob
     current_chunk_latents: torch.Tensor
+    ready_event: torch.cuda.Event | None = None
 
 @dataclass
 class _DecodedPixelsChunk:
     job: _ChunkJob
     decoded_pixels: torch.Tensor
+    ready_event: torch.cuda.Event | None = None
 
 def _module_device(module: torch.nn.Module) -> torch.device:
     if hasattr(module, "device"):
@@ -133,6 +149,22 @@ def _load_vae_for_device(cfg: ExpConfig, device: torch.device) -> torch.nn.Modul
     vae.eval()
     return vae
 
+
+def _vae_latent_hw(vae: torch.nn.Module, height: int, width: int) -> tuple[int, int]:
+    spatial_factor = int(getattr(vae, "ffactor_spatial", 0) or 0)
+    if spatial_factor <= 0:
+        raise ValueError("VAE must expose a positive ffactor_spatial")
+    canonical_height, canonical_width = int(height), int(width)
+    stem = getattr(vae, "stem", None)
+    if (
+        stem is not None and
+        canonical_height % int(stem.stride) == 0 and
+        canonical_width % int(stem.stride) == 0
+    ):
+        canonical_height = canonical_height * int(stem.group) // int(stem.stride)
+        canonical_width = canonical_width * int(stem.group) // int(stem.stride)
+    return canonical_height // spatial_factor, canonical_width // spatial_factor
+
 class JoyOmniRuntime:
     def __init__(
         self,
@@ -143,6 +175,7 @@ class JoyOmniRuntime:
         decode_vae: torch.nn.Module | None = None,
         pseudo_encode_vae: torch.nn.Module | None = None,
         postprocess_device: torch.device | None = None,
+        stateful_vae: bool = False,
     ):
         self.cfg = cfg
         self.pipeline = pipeline
@@ -150,6 +183,7 @@ class JoyOmniRuntime:
         self.decode_vae = decode_vae or pipeline.vae
         self.pseudo_encode_vae = pseudo_encode_vae or self.decode_vae
         self.postprocess_device = postprocess_device or _module_device(self.pseudo_encode_vae)
+        self.stateful_vae = bool(stateful_vae)
         self.dit_lock = threading.Lock()
 
     @classmethod
@@ -176,7 +210,14 @@ class JoyOmniRuntime:
         vae_encode_device_obj = torch.device(encode_device_arg) if encode_device_arg is not None else None
         vae_decode_device_obj = torch.device(decode_device_arg) if decode_device_arg is not None else None
         vae_pseudo_device_obj = torch.device(pseudo_device_arg) if pseudo_device_arg is not None else None
-        postprocess_device_obj = torch.device(postprocess_device) if postprocess_device is not None else vae_pseudo_device_obj
+        stateful_vae = _env_enabled("JOYOMNI_STATEFUL_VAE", default=False)
+        postprocess_default = (
+            vae_decode_device_obj if stateful_vae else vae_pseudo_device_obj
+        )
+        postprocess_device_obj = (
+            torch.device(postprocess_device)
+            if postprocess_device is not None else postprocess_default
+        )
         seed_everything(seed)
 
         cfg = ExpConfig()
@@ -216,16 +257,21 @@ class JoyOmniRuntime:
             decode_vae = _load_vae_for_device(cfg, vae_decode_device_obj)
             print(f"#####[STREAM] loaded decode VAE on {vae_decode_device_obj}")
         pseudo_encode_vae = decode_vae
-        if vae_pseudo_device_obj is not None:
+        if not stateful_vae and vae_pseudo_device_obj is not None:
             pseudo_encode_vae = _load_vae_for_device(cfg, vae_pseudo_device_obj)
             print(f"#####[STREAM] loaded pseudo encode VAE on {vae_pseudo_device_obj}")
+        elif stateful_vae:
+            print("#####[STREAM] stateful causal VAE enabled; pseudo encoder eliminated")
 
         if hasattr(pipeline, "set_progress_bar_config"):
             pipeline.set_progress_bar_config(disable=True)
         pipeline.transformer.eval()
 
         _orientations = [(warmup_height, warmup_width)]
-        if (warmup_width, warmup_height) != (warmup_height, warmup_width):
+        if (
+            _env_enabled("JOYOMNI_WARMUP_BOTH_ORIENTATIONS", default=True)
+            and (warmup_width, warmup_height) != (warmup_height, warmup_width)
+        ):
             _orientations.append((warmup_width, warmup_height))
 
         try:
@@ -235,11 +281,18 @@ class JoyOmniRuntime:
             _ddev = _module_device(decode_vae)
             if _lat_c > 0 and _fspa > 0:
                 for (_wh, _ww) in _orientations:
-                    _vc.warmup_decode(
-                        decode_vae, _lat_c,
-                        _wh // _fspa, _ww // _fspa,
-                        device=_ddev, dtype=PRECISION_TO_TYPE[cfg.vae_precision],
-                    )
+                    _latent_h, _latent_w = _vae_latent_hw(decode_vae, _wh, _ww)
+                    if stateful_vae:
+                        _vc.warmup_stream_decode(
+                            decode_vae, _lat_c, _latent_h, _latent_w,
+                            device=_ddev, dtype=PRECISION_TO_TYPE[cfg.vae_precision],
+                        )
+                    else:
+                        _vc.warmup_decode(
+                            decode_vae, _lat_c,
+                            _latent_h, _latent_w,
+                            device=_ddev, dtype=PRECISION_TO_TYPE[cfg.vae_precision],
+                        )
         except Exception as _vc_exc:
             print(f"#####[STREAM] VAE compile warmup skipped: {_vc_exc!r}")
 
@@ -249,21 +302,26 @@ class JoyOmniRuntime:
             _vae_ac = (_vae_dt != torch.float32)
 
             _src_vae = pipeline.vae
-            _pseudo_scale = float(getattr(getattr(pseudo_encode_vae, "head", None), "scale", 1.0))
             for (_wh, _ww) in _orientations:
-                _vc.warmup_encode(
-                    _src_vae, 3, _wh, _ww,
-                    device=_module_device(_src_vae), dtype=_vae_dt,
-                    temporal_lens=(1, 1 + int(getattr(_src_vae, "ffactor_temporal", 8) or 8)),
-                    autocast=_vae_ac,
-                )
-                _vc.warmup_encode(
-                    pseudo_encode_vae, 3,
-                    round(_wh * _pseudo_scale), round(_ww * _pseudo_scale),
-                    device=_module_device(pseudo_encode_vae), dtype=_vae_dt,
-                    temporal_lens=(1,),
-                    autocast=_vae_ac,
-                )
+                if stateful_vae:
+                    _vc.warmup_stream_encode(
+                        _src_vae, 3, _wh, _ww,
+                        device=_module_device(_src_vae), dtype=_vae_dt,
+                        autocast=_vae_ac,
+                    )
+                else:
+                    _vc.warmup_encode(
+                        _src_vae, 3, _wh, _ww,
+                        device=_module_device(_src_vae), dtype=_vae_dt,
+                        temporal_lens=(1, 1 + int(getattr(_src_vae, "ffactor_temporal", 8) or 8)),
+                        autocast=_vae_ac,
+                    )
+                    _vc.warmup_encode(
+                        pseudo_encode_vae, 3, _wh, _ww,
+                        device=_module_device(pseudo_encode_vae), dtype=_vae_dt,
+                        temporal_lens=(1,),
+                        autocast=_vae_ac,
+                    )
 
             _ref_basesize = getattr(cfg, "ref_image_basesize", DEFAULT_REFERENCE_IMG_IV2V_BASESIZE)
             _ref_cfgs = generate_video_image_bucket(
@@ -287,6 +345,7 @@ class JoyOmniRuntime:
             decode_vae=decode_vae,
             pseudo_encode_vae=pseudo_encode_vae,
             postprocess_device=postprocess_device_obj,
+            stateful_vae=stateful_vae,
         )
 
         try:
@@ -317,6 +376,11 @@ class JoyOmniRuntime:
         height: int = 480,
         width: int = 832,
         num_chunks: int = _FULL_WARMUP_CHUNKS,
+        prompt: str = "warmup",
+        num_inference_steps: int = 2,
+        max_temporal_ids: int | None = None,
+        freeze_kv_on_static: bool = False,
+        static_diff_thresh: float = 2.0,
     ) -> None:
         t0 = time.time()
 
@@ -328,10 +392,14 @@ class JoyOmniRuntime:
             settings = StreamingSettings(
                 height=height,
                 width=width,
+                num_inference_steps=num_inference_steps,
+                max_temporal_ids=max_temporal_ids,
+                freeze_kv_on_static=freeze_kv_on_static,
+                static_diff_thresh=static_diff_thresh,
                 profile_timings=False,
             )
             session = self.create_v2v_session(
-                prompt="warmup", settings=settings,
+                prompt=prompt, settings=settings,
             )
             rng = np.random.default_rng(0)
             completed = 0
@@ -357,8 +425,6 @@ class JoyOmniRuntime:
                     session.close()
                 except Exception:
                     pass
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
 class JoyOmniV2VStreamingSession:
     def __init__(
@@ -375,12 +441,41 @@ class JoyOmniV2VStreamingSession:
         self.decode_vae = runtime.decode_vae
         self.pseudo_encode_vae = runtime.pseudo_encode_vae
         self.postprocess_device = runtime.postprocess_device
+        self.stateful_vae = runtime.stateful_vae
         self.cfg = runtime.cfg
         self.raw_prompt = prompt
         self.prompt = prompt
         self.settings = settings
         self.ref_image = ref_image.convert("RGB") if ref_image is not None else None
         self.ref_image_latent: torch.Tensor | None = None
+        # Experimental latency/quality trade-off: retain the target-token K/V
+        # already produced by the final denoise step instead of running a third
+        # transformer pass over the clean latent.  Exact clean-cache storage
+        # remains the default until the streaming quality gate is qualified.
+        cache_last_denoise_kv = (
+            _env_enabled("JOYOMNI_CACHE_LAST_DENOISE_KV", False)
+            if settings.cache_last_denoise_kv is None
+            else bool(settings.cache_last_denoise_kv)
+        )
+        self._cache_last_denoise_kv = (
+            cache_last_denoise_kv
+            and settings.store_clean_self_only
+            and settings.num_inference_steps >= 2
+        )
+        clean_prefix_value = (
+            os.environ.get("JOYOMNI_CLEAN_KV_PREFIX_LAYERS", "0")
+            if settings.clean_kv_prefix_layers is None
+            else settings.clean_kv_prefix_layers
+        )
+        self._clean_kv_prefix_layers = int(clean_prefix_value)
+        num_transformer_layers = len(self.pipeline.transformer.double_blocks)
+        if not 0 <= self._clean_kv_prefix_layers <= num_transformer_layers:
+            raise ValueError(
+                "clean KV prefix layers must be between 0 and "
+                f"{num_transformer_layers}, got {self._clean_kv_prefix_layers}."
+            )
+        if not self._cache_last_denoise_kv:
+            self._clean_kv_prefix_layers = 0
         self.device = self.pipeline.transformer.device
         self.generator = torch.Generator(device=self.device).manual_seed(settings.seed)
 
@@ -402,13 +497,11 @@ class JoyOmniV2VStreamingSession:
 
         self.ffactor_t = int(self.pipeline.vae_scale_factor_temporal)
         self.latent_channels = int(self.pipeline.vae.config.latent_channels)
-        _stem = getattr(self.pipeline.vae, "stem", None)
-        _canon_h, _canon_w = settings.height, settings.width
-        if _stem is not None and settings.height % _stem.stride == 0 and settings.width % _stem.stride == 0:
-            _canon_h = settings.height * _stem.group // _stem.stride
-            _canon_w = settings.width * _stem.group // _stem.stride
-        self.latent_h = _canon_h // int(self.pipeline.vae_scale_factor)
-        self.latent_w = _canon_w // int(self.pipeline.vae_scale_factor)
+        self.latent_h, self.latent_w = _vae_latent_hw(
+            self.pipeline.vae,
+            settings.height,
+            settings.width,
+        )
         self.local_window_size = int(getattr(self.pipeline.transformer.config, "local_window_size", 1))
         self.global_sink_chunk = self.pipeline._resolve_global_sink_chunk(None, self.pipeline.transformer)
         self.enable_denormalization = (
@@ -441,6 +534,24 @@ class JoyOmniV2VStreamingSession:
         self._pseudo_latent_condition = threading.Condition()
         self._pseudo_latent_chunk_idx: int | None = None
         self._pseudo_latent: torch.Tensor | None = None
+        self._pseudo_latent_ready_event: torch.cuda.Event | None = None
+        # Compiled stateful VAE graphs currently hang when first replayed from
+        # a non-default ROCm stream (the decode worker stalls while every
+        # upstream queue fills). Keep the proven default-stream execution path
+        # unless explicit streams are deliberately enabled for qualification.
+        self._use_explicit_streams = (
+            self.device_type == "cuda" and
+            os.environ.get("JOYOMNI_EXPLICIT_STREAMS", "0").lower()
+            not in {"0", "false", "no", "off"}
+        )
+        self._encode_stream = self._new_stage_stream(_module_device(self.pipeline.vae))
+        self._dit_stream = self._new_stage_stream(self.device)
+        self._decode_stream = self._new_stage_stream(_module_device(self.decode_vae))
+        self._pseudo_stream = (
+            None if self.stateful_vae
+            else self._new_stage_stream(_module_device(self.pseudo_encode_vae))
+        )
+        self._postprocess_stream = self._new_stage_stream(self.postprocess_device)
         self._debug_lock = threading.Lock()
         self._debug_started_at = time.time()
         self._debug_worker_states: dict[str, dict[str, Any]] = {}
@@ -452,7 +563,74 @@ class JoyOmniV2VStreamingSession:
             "pseudo_encoded_chunks": 0,
             "postprocessed_chunks": 0,
             "returned_results": 0,
+            "dropped_results": 0,
         }
+
+    def _new_stage_stream(self, device: torch.device | str) -> torch.cuda.Stream | None:
+        device_obj = torch.device(device)
+        if not self._use_explicit_streams or device_obj.type != "cuda":
+            return None
+        return torch.cuda.Stream(device=device_obj)
+
+    @staticmethod
+    def _stage_stream_context(stream: torch.cuda.Stream | None):
+        return torch.cuda.stream(stream) if stream is not None else nullcontext()
+
+    @staticmethod
+    def _record_stage_ready(stream: torch.cuda.Stream | None) -> torch.cuda.Event | None:
+        if stream is None:
+            return None
+        ready = torch.cuda.Event()
+        ready.record(stream)
+        return ready
+
+    @staticmethod
+    def _wait_stage_ready(
+        stream: torch.cuda.Stream | None,
+        ready: torch.cuda.Event | None,
+        tensor: torch.Tensor | None = None,
+    ) -> None:
+        if stream is None or ready is None:
+            return
+        stream.wait_event(ready)
+        if tensor is not None and tensor.device.type == "cuda":
+            # The caching allocator otherwise only knows the producer stream.
+            # Keep the storage alive until this consumer stream has finished.
+            tensor.record_stream(stream)
+
+    def _prime_stage_streams(self) -> None:
+        """Make each worker stream wait for session initialization."""
+        streams = [
+            self._encode_stream,
+            self._dit_stream,
+            self._decode_stream,
+            self._pseudo_stream,
+            self._postprocess_stream,
+        ]
+        by_device: dict[torch.device, list[torch.cuda.Stream]] = {}
+        for stream in streams:
+            if stream is not None:
+                by_device.setdefault(torch.device(stream.device), []).append(stream)
+        for device, device_streams in by_device.items():
+            initialized = torch.cuda.Event()
+            initialized.record(torch.cuda.current_stream(device))
+            for stream in device_streams:
+                stream.wait_event(initialized)
+
+    def _synchronize_stage_devices(self) -> None:
+        devices = {
+            torch.device(stream.device)
+            for stream in (
+                self._encode_stream,
+                self._dit_stream,
+                self._decode_stream,
+                self._pseudo_stream,
+                self._postprocess_stream,
+            )
+            if stream is not None
+        }
+        for device in devices:
+            torch.cuda.synchronize(device)
 
     def _timer_start(
         self,
@@ -466,13 +644,38 @@ class JoyOmniV2VStreamingSession:
 
     def _timer_record(
         self,
-        profile: dict[str, float | int],
+        profile: dict[str, Any],
         key: str,
-        started: float,
+        started: _ProfileTimer | float,
     ) -> None:
         if not self.settings.profile_timings:
             return
-        profile[key] = float(profile.get(key, 0.0)) + _profile_timer_elapsed(started)
+        if isinstance(started, _ProfileTimer):
+            if started.start_event is not None and started.device is not None:
+                end_event = torch.cuda.Event(enable_timing=True)
+                end_event.record(torch.cuda.current_stream(started.device))
+                profile.setdefault(_PENDING_CUDA_TIMERS_KEY, []).append(
+                    _PendingCudaTimer(key, started.start_event, end_event)
+                )
+                return
+            elapsed = time.perf_counter() - started.wall_start
+        else:
+            elapsed = time.perf_counter() - float(started)
+        profile[key] = float(profile.get(key, 0.0)) + elapsed
+
+    @staticmethod
+    def _resolve_cuda_profile_timers(profile: dict[str, Any]) -> None:
+        pending = profile.pop(_PENDING_CUDA_TIMERS_KEY, [])
+        if not pending:
+            return
+        # Resolve at the chunk boundary, after the output D2H transfer has
+        # already established completion. Synchronizing every individual stage
+        # at record time would serialize the otherwise asynchronous GPU pipe.
+        for timer in pending:
+            timer.end_event.synchronize()
+        for timer in pending:
+            elapsed = float(timer.start_event.elapsed_time(timer.end_event)) / 1000.0
+            profile[timer.key] = float(profile.get(timer.key, 0.0)) + elapsed
 
     def _record_queue_wait(
         self,
@@ -503,6 +706,8 @@ class JoyOmniV2VStreamingSession:
         self,
         frame: Image.Image,
         frame_meta: dict[str, Any] | None = None,
+        *,
+        drain_results: bool = True,
     ) -> list[StreamingChunkResult]:
         self._raise_worker_error_if_needed()
         frame = self._resize_frame(frame)
@@ -513,7 +718,8 @@ class JoyOmniV2VStreamingSession:
             self._initialize(frame)
             self._start_async_workers()
             results.extend(self._submit_or_process_chunk([frame], [meta]))
-            results.extend(self._drain_async_results())
+            if drain_results:
+                results.extend(self._drain_async_results())
             self._raise_worker_error_if_needed()
             return results
 
@@ -525,16 +731,18 @@ class JoyOmniV2VStreamingSession:
             del self.pending_frames[: self.ffactor_t]
             del self.pending_metas[: self.ffactor_t]
             results.extend(self._submit_or_process_chunk(chunk_frames, chunk_metas))
-        results.extend(self._drain_async_results())
+        if drain_results:
+            results.extend(self._drain_async_results())
         self._raise_worker_error_if_needed()
         return results
 
     def close(self) -> None:
+        # Quiesce the pipeline before mutating feature/KV caches.  Workers may
+        # still be draining queued chunks during warmup, restart, or a client
+        # disconnect; clearing live cache state races their model forwards.
+        self._stop_async_workers()
         self._clear_vae_feature_caches()
         self.pipeline.transformer.reset_inference_kv_cache()
-        self._stop_async_workers()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def _initialize(self, first_frame: Image.Image) -> None:
@@ -686,6 +894,18 @@ class JoyOmniV2VStreamingSession:
             "input_frames": input_frames,
             "steps": int(self.settings.num_inference_steps),
             "profile_timings": int(self.settings.profile_timings),
+            "profile_timing_mode": "deferred_cuda_events" if self.settings.profile_timings else "wall_only",
+            "gpu_stream_mode": "explicit_per_stage" if self._use_explicit_streams else "default",
+            "stateful_vae": int(self.stateful_vae),
+            "kv_store_strategy": (
+                (
+                    f"last_denoise_clean_prefix_{self._clean_kv_prefix_layers}"
+                    if self._clean_kv_prefix_layers
+                    else "last_denoise_approx"
+                )
+                if self._cache_last_denoise_kv
+                else "clean_exact"
+            ),
             "dit_device": str(self.device),
             "vae_encode_device": str(_module_device(self.pipeline.vae)),
             "vae_decode_device": str(_module_device(self.decode_vae)),
@@ -772,8 +992,20 @@ class JoyOmniV2VStreamingSession:
 
         self.pipeline.scheduler.set_timesteps(self.settings.num_inference_steps, device=self.device)
         timesteps_for_chunk = self.pipeline.scheduler.timesteps
+        current_temporal_ids_batch = current_chunk_temporal_ids.unsqueeze(0).expand(
+            current_chunk_latents.shape[0], -1
+        )
+        cached_temporal_ids_batch = (
+            cached_temporal_ids.unsqueeze(0).expand(current_chunk_latents.shape[0], -1)
+            if cached_temporal_ids is not None
+            else None
+        )
 
-        for timestep in timesteps_for_chunk:
+        for step_idx, timestep in enumerate(timesteps_for_chunk):
+            store_from_this_step = (
+                self._cache_last_denoise_kv
+                and step_idx == len(timesteps_for_chunk) - 1
+            )
             autocast_context = _autocast_ctx(
                 self.device_type, self.target_dtype, self.autocast_enabled
             )
@@ -794,36 +1026,60 @@ class JoyOmniV2VStreamingSession:
                         encoder_hidden_states=self.streaming_cond_embeds,
                         encoder_hidden_states_mask=self.streaming_cond_mask,
                         ref_video_latent=ref_chunk_latent,
-                        current_temporal_ids=current_chunk_temporal_ids.unsqueeze(0).expand(
-                            latent_model_input.shape[0], -1
-                        ),
-                        cached_temporal_ids=(
-                            cached_temporal_ids.unsqueeze(0).expand(latent_model_input.shape[0], -1)
-                            if cached_temporal_ids is not None
-                            else None
-                        ),
-                        kv_cache_mode="reuse",
+                        current_temporal_ids=current_temporal_ids_batch,
+                        cached_temporal_ids=cached_temporal_ids_batch,
+                        kv_cache_mode="reuse_store" if store_from_this_step else "reuse",
                         kv_cache_scope="cond",
                         kv_cache_chunk_id=active_chunk_id,
                         kv_cache_selected_chunk_ids=cache_memory_ids,
                         kv_cache_pre_rope=True,
+                        kv_cache_store_current_only=store_from_this_step,
                     )[0]
                     self._timer_record(profile, "dit_forward_cond_s", started)
+                    self._timer_record(
+                        profile, f"dit_forward_cond_step_{step_idx}_s", started
+                    )
 
-                sample_for_step = current_chunk_latents.clone()
                 current_chunk_latents = self.pipeline.scheduler.step(
                     noise_pred,
                     timestep,
-                    sample_for_step,
+                    current_chunk_latents,
                     return_dict=False,
                 )[0]
+
+        if self._cache_last_denoise_kv:
+            # The active cache was written as part of the last denoise forward.
+            # Optionally overwrite an exact prefix from the final clean latent;
+            # untouched later layers retain their last-denoise entries.
+            if self._clean_kv_prefix_layers:
+                started = self._timer_start(self.device, use_cuda_event=False)
+                self._timer_record(profile, "kv_store_setup_s", started)
+                started = self._timer_start(self.device)
+                self.pipeline._store_clean_chunk_kv_cache(
+                    self.pipeline.transformer,
+                    clean_chunk_latents=current_chunk_latents.to(self.target_dtype),
+                    chunk_temporal_ids=current_chunk_temporal_ids.unsqueeze(0).expand(
+                        current_chunk_latents.shape[0], -1
+                    ),
+                    prompt_embeds=self.streaming_cond_embeds,
+                    prompt_embeds_mask=self.streaming_cond_mask,
+                    active_chunk_id=active_chunk_id,
+                    history_chunk_ids=[],
+                    pre_rope=True,
+                    cached_temporal_ids=None,
+                    store_mode="store",
+                    store_prefix_layers=self._clean_kv_prefix_layers,
+                )
+                self._timer_record(profile, "kv_store_forward_s", started)
+            # `_evict_after_store` immediately applies the next-window policy.
+            return current_chunk_latents
 
         keep_before_store = {self.pipeline._kv_cache_memory_id("clean", cid) for cid in history_chunk_ids}
         if self.ref_image_kv_prefilled:
             keep_before_store.add(self.pipeline._kv_cache_memory_id("ref_image"))
         self.pipeline.transformer.evict_kv_cache_chunks(keep_before_store)
 
-        started = self._timer_start(self.device)
+        started = self._timer_start(self.device, use_cuda_event=False)
         store_self_only = self.settings.store_clean_self_only
         store_history_chunk_ids = [] if store_self_only else history_chunk_ids
         store_mode = "store" if store_self_only else "reuse_store"
@@ -866,6 +1122,8 @@ class JoyOmniV2VStreamingSession:
         total_started: float,
     ) -> None:
         if self.settings.profile_timings:
+            self._resolve_cuda_profile_timers(profile)
+        if self.settings.profile_timings:
             self._timer_record(profile, "total_server_chunk_s", total_started)
         else:
             profile["total_server_chunk_s"] = time.perf_counter() - total_started
@@ -883,11 +1141,13 @@ class JoyOmniV2VStreamingSession:
             print(
                 f"#####[STREAM] chunk={profile['chunk_idx']} in_frames={input_frames} "
                 f"out_frames={output_frames} elapsed={elapsed:.3f}s "
+                f"upload={float(profile.get('frames_to_tensor_gpu_s', 0.0)):.3f}s "
                 f"vae_enc={float(profile.get('vae_encode_s', 0.0)):.3f}s "
                 f"dit={float(profile.get('dit_denoise_s', 0.0)):.3f}s "
                 f"kv_store={float(profile.get('kv_store_s', 0.0)):.3f}s "
                 f"vae_dec={float(profile.get('vae_decode_s', 0.0)):.3f}s "
-                f"pack={float(profile.get('pack_frames_s', 0.0)):.3f}s"
+                f"pack={float(profile.get('pack_frames_s', 0.0)):.3f}s "
+                f"pack_gpu={float(profile.get('pack_frames_gpu_s', 0.0)):.3f}s"
             )
 
             print(
@@ -919,19 +1179,32 @@ class JoyOmniV2VStreamingSession:
     def _start_async_workers(self) -> None:
         if self._encode_queue is not None:
             return
+        self._prime_stage_streams()
         self._encode_queue = queue.Queue(maxsize=4)
         self._dit_queue = queue.Queue(maxsize=4)
         self._decode_queue = queue.Queue(maxsize=4)
-        self._pseudo_queue = queue.Queue(maxsize=4)
+        self._pseudo_queue = None if self.stateful_vae else queue.Queue(maxsize=4)
         self._postprocess_queue = queue.Queue(maxsize=4)
-        self._result_queue = queue.Queue()
+        # Raw 720p RGB chunks are about 21 MiB each.  Bound this handoff so a
+        # slow/disconnected WebSocket cannot grow host RAM without limit.
+        # Dropping the oldest completed chunk preserves realtime latency; each
+        # subsequently encoded H.264 chunk starts with an IDR frame.
+        self._result_queue = queue.Queue(maxsize=4)
         self._workers = [
             threading.Thread(target=self._encode_worker, name="joyomni-vae-encode", daemon=True),
             threading.Thread(target=self._dit_worker, name="joyomni-dit-denoise", daemon=True),
             threading.Thread(target=self._decode_worker, name="joyomni-vae-decode", daemon=True),
-            threading.Thread(target=self._pseudo_worker, name="joyomni-pseudo-encode", daemon=True),
             threading.Thread(target=self._postprocess_worker, name="joyomni-postprocess", daemon=True),
         ]
+        if not self.stateful_vae:
+            self._workers.insert(
+                3,
+                threading.Thread(
+                    target=self._pseudo_worker,
+                    name="joyomni-pseudo-encode",
+                    daemon=True,
+                ),
+            )
         for worker in self._workers:
             worker.start()
 
@@ -945,6 +1218,9 @@ class JoyOmniV2VStreamingSession:
                 self._encode_queue.put(None)
         for worker in self._workers:
             worker.join()
+        # Worker functions enqueue asynchronously.  Quiesce every stage before
+        # close() clears model feature/KV caches or releases queued tensors.
+        self._synchronize_stage_devices()
         self._encode_queue = None
         self._dit_queue = None
         self._decode_queue = None
@@ -1116,15 +1392,21 @@ class JoyOmniV2VStreamingSession:
             self._record_queue_wait(job.profile, "q_wait_encode_s", _q_started)
             try:
                 self._set_debug_state("vae-encode", "encode", job.chunk_idx)
-                started = self._timer_start()
-                ref_chunk_latent = self._encode_reference_chunk(
-                    job.source_frames,
-                    profile=job.profile,
-                    chunk_idx=job.chunk_idx,
-                )
-                self._timer_record(job.profile, "reference_prepare_s", started)
+                with self._stage_stream_context(self._encode_stream):
+                    started = self._timer_start()
+                    ref_chunk_latent = self._encode_reference_chunk(
+                        job.source_frames,
+                        profile=job.profile,
+                        chunk_idx=job.chunk_idx,
+                    )
+                    self._timer_record(job.profile, "reference_prepare_s", started)
+                    ready_event = self._record_stage_ready(self._encode_stream)
                 self._set_debug_state("vae-encode", "put_dit_queue", job.chunk_idx)
-                self._dit_queue.put(_EncodedChunk(job=job, ref_chunk_latent=ref_chunk_latent))
+                self._dit_queue.put(_EncodedChunk(
+                    job=job,
+                    ref_chunk_latent=ref_chunk_latent,
+                    ready_event=ready_event,
+                ))
                 self._inc_debug_counter("encoded_chunks")
             except BaseException as exc:
                 self._set_debug_state("vae-encode", "error", job.chunk_idx)
@@ -1147,20 +1429,29 @@ class JoyOmniV2VStreamingSession:
             try:
                 with self.runtime.dit_lock:
                     self._set_debug_state("dit-denoise", "denoise", encoded.job.chunk_idx)
-                    current_chunk_latents = self._denoise_chunk(
-                        encoded.ref_chunk_latent,
-                        profile=encoded.job.profile,
-                        chunk_idx=encoded.job.chunk_idx,
-                        frozen_anchor_id=encoded.job.frozen_anchor_id,
-                    )
-                    self._evict_after_store(
-                        encoded.job.chunk_idx,
-                        encoded.job.profile,
-                        frozen_anchor_id=encoded.job.frozen_anchor_id,
-                    )
+                    with self._stage_stream_context(self._dit_stream):
+                        self._wait_stage_ready(
+                            self._dit_stream, encoded.ready_event, encoded.ref_chunk_latent
+                        )
+                        current_chunk_latents = self._denoise_chunk(
+                            encoded.ref_chunk_latent,
+                            profile=encoded.job.profile,
+                            chunk_idx=encoded.job.chunk_idx,
+                            frozen_anchor_id=encoded.job.frozen_anchor_id,
+                        )
+                        self._evict_after_store(
+                            encoded.job.chunk_idx,
+                            encoded.job.profile,
+                            frozen_anchor_id=encoded.job.frozen_anchor_id,
+                        )
+                        ready_event = self._record_stage_ready(self._dit_stream)
                 self._set_debug_state("dit-denoise", "put_decode_queue", encoded.job.chunk_idx)
                 self._decode_queue.put(
-                    _DenoisedChunk(job=encoded.job, current_chunk_latents=current_chunk_latents)
+                    _DenoisedChunk(
+                        job=encoded.job,
+                        current_chunk_latents=current_chunk_latents,
+                        ready_event=ready_event,
+                    )
                 )
                 self._inc_debug_counter("denoised_chunks")
             except BaseException as exc:
@@ -1171,39 +1462,60 @@ class JoyOmniV2VStreamingSession:
 
     def _decode_worker(self) -> None:
         assert self._decode_queue is not None
-        assert self._pseudo_queue is not None
         assert self._postprocess_queue is not None
+        if not self.stateful_vae:
+            assert self._pseudo_queue is not None
         while True:
             self._set_debug_state("vae-decode", "wait_decode_queue")
             _q_started = time.perf_counter()
             denoised = self._decode_queue.get()
             if denoised is None:
                 self._set_debug_state("vae-decode", "stop")
-                self._pseudo_queue.put(None)
+                if self._pseudo_queue is not None:
+                    self._pseudo_queue.put(None)
                 self._postprocess_queue.put(None)
                 return
             self._record_queue_wait(denoised.job.profile, "q_wait_decode_s", _q_started)
             try:
                 self._set_debug_state("vae-decode", "decode_pixels", denoised.job.chunk_idx)
-                decoded_pixels = self._decode_chunk_pixels(
-                    denoised.current_chunk_latents,
-                    profile=denoised.job.profile,
-                    chunk_idx=denoised.job.chunk_idx,
-                )
+                with self._stage_stream_context(self._decode_stream):
+                    self._wait_stage_ready(
+                        self._decode_stream,
+                        denoised.ready_event,
+                        denoised.current_chunk_latents,
+                    )
+                    decoded_pixels = self._decode_chunk_pixels(
+                        denoised.current_chunk_latents,
+                        profile=denoised.job.profile,
+                        chunk_idx=denoised.job.chunk_idx,
+                    )
+                    ready_event = self._record_stage_ready(self._decode_stream)
 
-                self._set_debug_state("vae-decode", "put_pseudo_queue", denoised.job.chunk_idx)
-                self._pseudo_queue.put(
-                    _DecodedPixelsChunk(job=denoised.job, decoded_pixels=decoded_pixels)
-                )
+                if self._pseudo_queue is not None:
+                    self._set_debug_state(
+                        "vae-decode", "put_pseudo_queue", denoised.job.chunk_idx
+                    )
+                    self._pseudo_queue.put(
+                        _DecodedPixelsChunk(
+                            job=denoised.job,
+                            decoded_pixels=decoded_pixels,
+                            ready_event=ready_event,
+                        )
+                    )
                 self._set_debug_state("vae-decode", "put_postprocess_queue", denoised.job.chunk_idx)
                 self._postprocess_queue.put(
-                    _DecodedPixelsChunk(job=denoised.job, decoded_pixels=decoded_pixels)
+                    _DecodedPixelsChunk(
+                        job=denoised.job,
+                        decoded_pixels=decoded_pixels,
+                        ready_event=ready_event,
+                    )
                 )
                 self._inc_debug_counter("decoded_pixel_chunks")
             except BaseException as exc:
                 self._set_debug_state("vae-decode", "error", denoised.job.chunk_idx)
                 self._set_worker_error(exc)
-                self._pseudo_queue.put(None)
+                if self._pseudo_queue is not None:
+                    self._pseudo_queue.put(None)
                 self._postprocess_queue.put(None)
                 return
 
@@ -1219,11 +1531,15 @@ class JoyOmniV2VStreamingSession:
             self._record_queue_wait(decoded.job.profile, "q_wait_pseudo_s", _q_started)
             try:
                 self._set_debug_state("pseudo-encode", "pseudo_encode", decoded.job.chunk_idx)
-                self._encode_next_decode_pseudo_latent(
-                    decoded.decoded_pixels,
-                    profile=decoded.job.profile,
-                    chunk_idx=decoded.job.chunk_idx,
-                )
+                with self._stage_stream_context(self._pseudo_stream):
+                    self._wait_stage_ready(
+                        self._pseudo_stream, decoded.ready_event, decoded.decoded_pixels
+                    )
+                    self._encode_next_decode_pseudo_latent(
+                        decoded.decoded_pixels,
+                        profile=decoded.job.profile,
+                        chunk_idx=decoded.job.chunk_idx,
+                    )
                 self._inc_debug_counter("pseudo_encoded_chunks")
             except BaseException as exc:
                 self._set_debug_state("pseudo-encode", "error", decoded.job.chunk_idx)
@@ -1244,13 +1560,17 @@ class JoyOmniV2VStreamingSession:
             self._record_queue_wait(decoded.job.profile, "q_wait_postprocess_s", _q_started)
             try:
                 self._set_debug_state("postprocess", "pack_frames", decoded.job.chunk_idx)
-                packed = self._pack_decoded_pixels(
-                    decoded.decoded_pixels,
-                    profile=decoded.job.profile,
-                    chunk_idx=decoded.job.chunk_idx,
-                )
+                with self._stage_stream_context(self._postprocess_stream):
+                    self._wait_stage_ready(
+                        self._postprocess_stream, decoded.ready_event, decoded.decoded_pixels
+                    )
+                    packed = self._pack_decoded_pixels(
+                        decoded.decoded_pixels,
+                        profile=decoded.job.profile,
+                        chunk_idx=decoded.job.chunk_idx,
+                    )
 
-                n_out = len(packed)
+                n_out = int(packed.shape[0])
                 self._finish_chunk_profile(
                     decoded.job.profile,
                     decoded.job.total_started,
@@ -1261,17 +1581,25 @@ class JoyOmniV2VStreamingSession:
                     n_out,
                 )
                 self._set_debug_state("postprocess", "put_result_queue", decoded.job.chunk_idx)
-                self._result_queue.put(
-                    StreamingChunkResult(
-                        jpegs=packed,
-                        profile=decoded.job.profile,
-                        source_metas=self._align_source_metas(
-                            decoded.job.source_metas,
-                            n_out,
-                        ),
-                        elapsed=float(decoded.job.profile.get("total_server_chunk_s", 0.0)),
-                    )
+                result = StreamingChunkResult(
+                    pixels=packed,
+                    profile=decoded.job.profile,
+                    source_metas=self._align_source_metas(
+                        decoded.job.source_metas,
+                        n_out,
+                    ),
+                    elapsed=float(decoded.job.profile.get("total_server_chunk_s", 0.0)),
                 )
+                while True:
+                    try:
+                        self._result_queue.put_nowait(result)
+                        break
+                    except queue.Full:
+                        try:
+                            self._result_queue.get_nowait()
+                            self._inc_debug_counter("dropped_results")
+                        except queue.Empty:
+                            continue
                 self._inc_debug_counter("postprocessed_chunks")
             except BaseException as exc:
                 self._set_debug_state("postprocess", "error", decoded.job.chunk_idx)
@@ -1287,11 +1615,26 @@ class JoyOmniV2VStreamingSession:
         chunk_idx: int | None = None,
     ) -> torch.Tensor:
         chunk_idx = self.chunk_idx if chunk_idx is None else chunk_idx
-        if chunk_idx == 0:
-            started = self._timer_start()
-            source_window = self._frames_to_tensor(source_frames[:1])
-            if profile is not None:
-                self._timer_record(profile, "frames_to_tensor_s", started)
+        encode_device = _module_device(self.pipeline.vae)
+        prepare_wall_started = time.perf_counter()
+        prepare_gpu_started = self._timer_start(encode_device)
+        if self.stateful_vae:
+            # XVAE's encoder is causal and already exposes exactly the cache
+            # needed between its 1-frame prologue and subsequent 8-frame
+            # chunks.  Feeding only new frames is mathematically equivalent to
+            # encoding the full sequence, and avoids recomputing the overlap
+            # frame plus every causal feature-cache prologue.
+            source_window = self._frames_to_tensor(
+                source_frames[:1] if chunk_idx == 0 else source_frames,
+                device=encode_device,
+                dtype=self.target_dtype,
+            )
+        elif chunk_idx == 0:
+            source_window = self._frames_to_tensor(
+                source_frames[:1],
+                device=encode_device,
+                dtype=self.target_dtype,
+            )
         else:
             if self.prev_source_frame is None:
                 raise RuntimeError("Missing previous source frame for streaming VAE encode.")
@@ -1299,28 +1642,46 @@ class JoyOmniV2VStreamingSession:
                 raise ValueError(
                     f"Expected {self.ffactor_t} frames after the first chunk, got {len(source_frames)}."
                 )
-            started = self._timer_start()
-            new_frames = self._frames_to_tensor(source_frames)
+            new_frames = self._frames_to_tensor(
+                source_frames,
+                device=encode_device,
+                dtype=self.target_dtype,
+            )
             source_window = torch.cat([self.prev_source_frame, new_frames], dim=2)
-            if profile is not None:
-                self._timer_record(profile, "frames_to_tensor_s", started)
 
-        self.prev_source_frame = source_window[:, :, -1:].detach().cpu()
-        encode_device = _module_device(self.pipeline.vae)
-        source_window = source_window.to(device=encode_device, dtype=self.target_dtype)
+        # Retain the overlap frame where the encoder runs. Keeping it on CPU
+        # caused every subsequent chunk to resend one full-resolution float
+        # frame and perform the temporal concatenation on the host.
+        if not self.stateful_vae:
+            self.prev_source_frame = source_window[:, :, -1:].detach().clone()
+        if profile is not None:
+            profile["frames_to_tensor_s"] = float(profile.get("frames_to_tensor_s", 0.0)) + (
+                time.perf_counter() - prepare_wall_started
+            )
+            self._timer_record(profile, "frames_to_tensor_gpu_s", prepare_gpu_started)
 
         _vc = _vae_compile_module()
-        _vc.maybe_setup_encode(self.pipeline.vae)
+        if self.stateful_vae:
+            _vc.maybe_setup_stream_encode(self.pipeline.vae)
+        else:
+            _vc.maybe_setup_encode(self.pipeline.vae)
         source_window = _vc.prep_input(source_window)
         started = self._timer_start(encode_device)
 
         _enc_dev_type = torch.device(encode_device).type
         _enc_ctx = _autocast_ctx(_enc_dev_type, self.vae_dtype, self.vae_autocast_enabled)
         with _enc_ctx:
-            ref_latent = self.pipeline._sample_vae_latents(
-                source_window,
-                enable_denormalization=self.enable_denormalization,
-            )
+            if self.stateful_vae:
+                posterior = self.pipeline.vae.encode_stream(source_window).latent_dist
+                ref_latent = posterior.sample()
+                if self.enable_denormalization:
+                    ref_latent = self.pipeline.normalize_latents(ref_latent)
+            else:
+                ref_latent = self.pipeline._sample_vae_latents(
+                    source_window,
+                    enable_denormalization=self.enable_denormalization,
+                    last_only=True,
+                )
         if profile is not None:
             self._timer_record(profile, "vae_encode_s", started)
         ref_latent = ref_latent[:, :, -self.chunk_size:].to(device=self.device, dtype=self.target_dtype)
@@ -1336,17 +1697,28 @@ class JoyOmniV2VStreamingSession:
             with self._pseudo_latent_condition:
                 if self._pseudo_latent_chunk_idx == chunk_idx and self._pseudo_latent is not None:
                     pseudo_latent = self._pseudo_latent
+                    ready_event = self._pseudo_latent_ready_event
                     self._pseudo_latent = None
                     self._pseudo_latent_chunk_idx = None
+                    self._pseudo_latent_ready_event = None
                     break
                 self._pseudo_latent_condition.wait(timeout=0.05)
             self._raise_worker_error_if_needed()
+        self._wait_stage_ready(
+            self._decode_stream, ready_event, pseudo_latent
+        )
         return pseudo_latent.to(device=decode_device, dtype=self.target_dtype)
 
-    def _store_decode_pseudo_latent(self, chunk_idx: int, pseudo_latent: torch.Tensor) -> None:
+    def _store_decode_pseudo_latent(
+        self,
+        chunk_idx: int,
+        pseudo_latent: torch.Tensor,
+        ready_event: torch.cuda.Event | None,
+    ) -> None:
         with self._pseudo_latent_condition:
             self._pseudo_latent = pseudo_latent.detach()
             self._pseudo_latent_chunk_idx = chunk_idx
+            self._pseudo_latent_ready_event = ready_event
             self._pseudo_latent_condition.notify_all()
 
     @torch.no_grad()
@@ -1365,9 +1737,13 @@ class JoyOmniV2VStreamingSession:
             chunk_lat_flat = self.pipeline.denormalize_latents(chunk_lat_flat)
 
         vae_device_type = vae_device.type
-        chunk_lat_flat = chunk_lat_flat.to(vae_device)
+        # The scheduler intentionally accumulates in fp32, while the compiled
+        # VAE decode graphs are warmed in the configured VAE precision. Cast
+        # before entering the graph so the first live chunk does not compile a
+        # second float32 specialization.
+        chunk_lat_flat = chunk_lat_flat.to(device=vae_device, dtype=self.vae_dtype)
 
-        if chunk_idx > 0:
+        if not self.stateful_vae and chunk_idx > 0:
             self._set_debug_state("vae-decode", "wait_pseudo_latent", chunk_idx)
             pseudo_latent = self._wait_decode_pseudo_latent(chunk_idx, vae_device)
             self._set_debug_state("vae-decode", "cat_pseudo_latent", chunk_idx)
@@ -1377,17 +1753,23 @@ class JoyOmniV2VStreamingSession:
             decode_input = chunk_lat_flat
 
         _vc = _vae_compile_module()
-        _vc.maybe_setup_decode(decode_vae)
+        if self.stateful_vae:
+            _vc.maybe_setup_stream_decode(decode_vae)
+        else:
+            _vc.maybe_setup_decode(decode_vae)
         decode_input = _vc.prep_input(decode_input)
 
         vae_ctx = _autocast_ctx(vae_device_type, self.vae_dtype, self.vae_autocast_enabled)
         with vae_ctx:
             started = self._timer_start(vae_device)
-            chunk_decoded = decode_vae.decode(decode_input, return_dict=False)[0]
+            if self.stateful_vae:
+                chunk_decoded = decode_vae.decode_stream(decode_input, return_dict=False)[0]
+            else:
+                chunk_decoded = decode_vae.decode(decode_input, return_dict=False)[0]
             if profile is not None:
                 self._timer_record(profile, "vae_decode_s", started)
 
-        if chunk_idx > 0:
+        if not self.stateful_vae and chunk_idx > 0:
             window_pixels = self.chunk_size * self.ffactor_t
             chunk_decoded = chunk_decoded[:, :, -window_pixels:]
         return chunk_decoded.detach()
@@ -1415,8 +1797,9 @@ class JoyOmniV2VStreamingSession:
                 pseudo_latent = pseudo_enc.latent_dist.sample()
             else:
                 pseudo_latent = pseudo_enc
-        self._set_debug_state("postprocess", "store_pseudo_latent", chunk_idx)
-        self._store_decode_pseudo_latent(chunk_idx + 1, pseudo_latent)
+        self._set_debug_state("pseudo-encode", "store_pseudo_latent", chunk_idx)
+        ready_event = self._record_stage_ready(self._pseudo_stream)
+        self._store_decode_pseudo_latent(chunk_idx + 1, pseudo_latent, ready_event)
         del prev_pixels, pseudo_enc, pseudo_latent
 
     @torch.no_grad()
@@ -1426,8 +1809,10 @@ class JoyOmniV2VStreamingSession:
         *,
         profile: dict[str, Any] | None = None,
         chunk_idx: int,
-    ) -> list[bytes]:
+    ) -> torch.Tensor:
         post_device = self.postprocess_device
+        wall_started = time.perf_counter()
+        gpu_started = self._timer_start(post_device)
 
         chunk_decoded = decoded_pixels.to(device=post_device)
         frames_u8 = (
@@ -1440,21 +1825,17 @@ class JoyOmniV2VStreamingSession:
             .permute(1, 2, 3, 0)
             .contiguous()
         )
-        arr = frames_u8.cpu().numpy()
-        started = time.perf_counter()
-
-        import cv2
-        enc_params = [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_CV2_QUALITY]
-        jpegs = []
-        for t in range(arr.shape[0]):
-            bgr = cv2.cvtColor(arr[t], cv2.COLOR_RGB2BGR)
-            ok, buf = cv2.imencode(".jpg", bgr, enc_params)
-            if not ok:
-                raise RuntimeError(f"cv2.imencode failed for frame {t} of chunk {chunk_idx}")
-            jpegs.append(buf.tobytes())
+        # Hand RGB pixels to the server so it can encode directly to the
+        # negotiated wire codec. Previously every chunk was JPEG encoded here;
+        # H.264 clients then decoded those JPEGs and encoded them a second time.
+        frames_cpu = frames_u8.cpu()
         if profile is not None:
-            profile["jpeg_encode_s"] = float(profile.get("jpeg_encode_s", 0.0)) + (time.perf_counter() - started)
-        return jpegs
+            profile["pack_frames_s"] = float(profile.get("pack_frames_s", 0.0)) + (
+                time.perf_counter() - wall_started
+            )
+            profile["output_rgb_bytes"] = int(frames_cpu.numel())
+            self._timer_record(profile, "pack_frames_gpu_s", gpu_started)
+        return frames_cpu
 
     def _next_selected_chunk_ids(self, chunk_idx: int | None = None) -> list[int]:
         chunk_idx = self.chunk_idx if chunk_idx is None else chunk_idx
@@ -1474,8 +1855,24 @@ class JoyOmniV2VStreamingSession:
         resampling = getattr(Image, "Resampling", Image).BICUBIC
         return frame.resize((self.settings.width, self.settings.height), resampling)
 
-    def _frames_to_tensor(self, frames: list[Image.Image]) -> torch.Tensor:
+    def _frames_to_tensor(
+        self,
+        frames: list[Image.Image],
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
         arrays = [np.asarray(self._resize_frame(frame), dtype=np.uint8) for frame in frames]
         pixel = torch.from_numpy(np.stack(arrays, axis=0))
-        pixel = rearrange(pixel, "t h w c -> 1 c t h w").to(torch.float32)
-        return pixel / 127.5 - 1.0
+        pixel = rearrange(pixel, "t h w c -> 1 c t h w")
+        if device is not None:
+            device_obj = torch.device(device)
+            # Transfer compact uint8 pixels first, then normalize on-device.
+            # This cuts host work and H2D bytes versus materializing float32
+            # video tensors on CPU.
+            pixel = pixel.to(device=device_obj, non_blocking=device_obj.type == "cuda")
+            pixel = pixel.to(torch.float32)
+        else:
+            pixel = pixel.to(torch.float32)
+        pixel = pixel / 127.5 - 1.0
+        return pixel.to(dtype=dtype)

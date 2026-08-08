@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import torch.nn as nn
@@ -9,6 +10,8 @@ import torch.nn as nn
 _configured: set[int] = set()
 _configured_encode: set[int] = set()
 _configured_encode_dynamic: set[int] = set()
+_configured_stream_encode: set[int] = set()
+_configured_stream_decode: set[int] = set()
 
 
 def _original_callable(module, name: str):
@@ -68,6 +71,178 @@ def maybe_setup_decode(vae) -> None:
 
 def prep_input(z: torch.Tensor) -> torch.Tensor:
     return z.to(memory_format=torch.channels_last_3d)
+
+
+def _channels_last_conv3d(vae) -> int:
+    n_conv = 0
+    for module in vae.modules():
+        if isinstance(module, nn.Conv3d):
+            module.weight.data = module.weight.data.to(memory_format=torch.channels_last_3d)
+            n_conv += 1
+    return n_conv
+
+
+def maybe_setup_stream_encode(vae) -> None:
+    if id(vae) in _configured_stream_encode:
+        return
+    if not hasattr(vae, "_encode_stream"):
+        raise RuntimeError("VAE has no _encode_stream implementation")
+    n_conv = _channels_last_conv3d(vae)
+    vae.reset_encode_stream()
+    cache_count = len(vae._enc_feat_map)
+    mode = os.environ.get(
+        "JOYOMNI_VAE_STREAM_COMPILE_MODE", "max-autotune-no-cudagraphs"
+    )
+
+    def first_core(x):
+        x = vae.patchify(vae.stem(x), vae.patch_size)
+        feature_cache = [None] * cache_count
+        feature_index = [0]
+        out = vae.encoder(
+            x,
+            feat_cache=feature_cache,
+            feat_idx=feature_index,
+            first_chunk=True,
+        )
+        return (out, *feature_cache)
+
+    def next_core(x, *cached_features):
+        x = vae.patchify(vae.stem(x), vae.patch_size)
+        feature_cache = list(cached_features)
+        feature_index = [0]
+        out = vae.encoder(
+            x,
+            feat_cache=feature_cache,
+            feat_idx=feature_index,
+            first_chunk=False,
+        )
+        return (out, *feature_cache)
+
+    vae._encode_stream_first_compiled = torch.compile(
+        first_core, mode=mode, dynamic=False
+    )
+    vae._encode_stream_next_compiled = torch.compile(
+        next_core, mode=mode, dynamic=False
+    )
+    _configured_stream_encode.add(id(vae))
+    print(
+        f"[vae_compile] converted {n_conv} Conv3d weights to channels_last_3d + "
+        "prepared stateful vae._encode_stream"
+    )
+
+
+def maybe_setup_stream_decode(vae) -> None:
+    if id(vae) in _configured_stream_decode:
+        return
+    if not hasattr(vae, "_decode_stream"):
+        raise RuntimeError("VAE has no _decode_stream implementation")
+    n_conv = _channels_last_conv3d(vae)
+    vae.reset_decode_stream()
+    cache_count = len(vae._dec_feat_map)
+    mode = os.environ.get(
+        "JOYOMNI_VAE_STREAM_COMPILE_MODE", "max-autotune-no-cudagraphs"
+    )
+
+    def finish(out):
+        return vae.head(vae.unpatchify(out, vae.patch_size))
+
+    def first_core(z):
+        feature_cache = [None] * cache_count
+        feature_index = [0]
+        out = vae.decoder(
+            z,
+            feat_cache=feature_cache,
+            feat_idx=feature_index,
+            first_chunk=True,
+        )
+        return (finish(out), *feature_cache)
+
+    def next_core(z, *cached_features):
+        feature_cache = list(cached_features)
+        feature_index = [0]
+        out = vae.decoder(
+            z,
+            feat_cache=feature_cache,
+            feat_idx=feature_index,
+            first_chunk=False,
+        )
+        return (finish(out), *feature_cache)
+
+    vae._decode_stream_first_compiled = torch.compile(
+        first_core, mode=mode, dynamic=False
+    )
+    vae._decode_stream_next_compiled = torch.compile(
+        next_core, mode=mode, dynamic=False
+    )
+    _configured_stream_decode.add(id(vae))
+    print(
+        f"[vae_compile] converted {n_conv} Conv3d weights to channels_last_3d + "
+        "prepared stateful vae._decode_stream"
+    )
+
+
+def warmup_stream_encode(vae, in_channels: int, h_px: int, w_px: int,
+                         device: torch.device, dtype: torch.dtype,
+                         autocast: bool = True) -> None:
+    maybe_setup_stream_encode(vae)
+    from contextlib import nullcontext
+    dev_type = torch.device(device).type
+    use_ac = autocast and dev_type in {"cuda", "cpu"}
+    vae.reset_encode_stream()
+    try:
+        # The cache tensor layouts transition once after the first steady
+        # chunk. Run two 8-frame chunks so both the post-prologue and stable
+        # functional graphs are compiled before a live session.
+        for t in (1, int(vae.ffactor_temporal), int(vae.ffactor_temporal)):
+            x = prep_input(torch.zeros(
+                1, in_channels, t, h_px, w_px, device=device, dtype=dtype
+            ))
+            ctx = (
+                torch.autocast(device_type=dev_type, dtype=dtype, enabled=True)
+                if use_ac else nullcontext()
+            )
+            with torch.no_grad(), ctx:
+                _ = vae.encode_stream(x)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            print(
+                f"[vae_compile] warmup stream encode shape "
+                f"(1,{in_channels},{t},{h_px},{w_px}) autocast={autocast}"
+            )
+    finally:
+        vae.reset_encode_stream()
+
+
+def warmup_stream_decode(vae, latent_channels: int, h_lat: int, w_lat: int,
+                         device: torch.device, dtype: torch.dtype,
+                         autocast: bool = True) -> None:
+    maybe_setup_stream_decode(vae)
+    from contextlib import nullcontext
+    dev_type = torch.device(device).type
+    use_ac = autocast and dev_type in {"cuda", "cpu"}
+    vae.reset_decode_stream()
+    try:
+        # As with encode, the cache layouts settle after the first non-prologue
+        # decode. Warm one additional chunk to avoid a live recompile.
+        for chunk_index in range(3):
+            z = prep_input(torch.zeros(
+                1, latent_channels, 1,
+                h_lat, w_lat, device=device, dtype=dtype
+            ))
+            ctx = (
+                torch.autocast(device_type=dev_type, dtype=dtype, enabled=True)
+                if use_ac else nullcontext()
+            )
+            with torch.no_grad(), ctx:
+                out = vae.decode_stream(z, return_dict=False)[0]
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            print(
+                f"[vae_compile] warmup stream decode chunk={chunk_index} "
+                f"input={tuple(z.shape)} output_t={out.shape[2]} autocast={autocast}"
+            )
+    finally:
+        vae.reset_decode_stream()
 
 
 def maybe_setup_encode(vae) -> None:

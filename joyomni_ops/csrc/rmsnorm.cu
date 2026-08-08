@@ -17,12 +17,34 @@ namespace joyomni_ops {
 namespace {
 
 __device__ __forceinline__ float warpSum(float v) {
+#if defined(__HIP_PLATFORM_AMD__)
+#pragma unroll
+  for (int o = warpSize / 2; o > 0; o >>= 1) v += __shfl_down(v, o);
+#else
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+#endif
   return v;
 }
 
 __device__ __forceinline__ float blockSum(float v) {
+#if defined(__HIP_PLATFORM_AMD__)
+  // Instinct executes wave64. Reduce within each wave first, then have wave 0
+  // reduce at most 16 partials.  Only thread 0 consumes the return value, so
+  // the caller's scalar-publication barrier is sufficient after wave 0.
+  __shared__ float sh[16];
+  const int lane = threadIdx.x % warpSize;
+  const int wid = threadIdx.x / warpSize;
+  v = warpSum(v);
+  if (lane == 0) sh[wid] = v;
+  __syncthreads();
+  if (wid == 0) {
+    const int nwaves = (blockDim.x + warpSize - 1) / warpSize;
+    v = lane < nwaves ? sh[lane] : 0.0f;
+    v = warpSum(v);
+  }
+  return v;  // valid on thread 0
+#else
   __shared__ float sh[32];
   int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
   v = warpSum(v);
@@ -32,6 +54,7 @@ __device__ __forceinline__ float blockSum(float v) {
   v = (threadIdx.x < nwarps) ? sh[lane] : 0.0f;
   if (wid == 0) v = warpSum(v);
   return v;  // valid on thread 0
+#endif
 }
 
 template <typename T>
@@ -63,8 +86,16 @@ __global__ void rmsnormKernel(
 template <typename T>
 void launch(const torch::Tensor& x, const torch::Tensor& weight, torch::Tensor& out, float eps) {
   const int64_t M = x.size(0), N = x.size(1);
+#if defined(__HIP_PLATFORM_AMD__)
+  // More elements per lane gives gfx950 enough blocks in flight to hide the
+  // wave-reduction and output-store latency.  Larger blocks were slower at
+  // the DiT's M=1560,N=4096 steady-state shape.
+  int block = 64;
+  while (block < N && block < 256) block <<= 1;
+#else
   int block = (int)std::min<int64_t>(1024, ((N + 31) / 32) * 32);
   if (block < 32) block = 32;
+#endif
   dim3 grid((unsigned)M);
   auto stream = at::cuda::getCurrentCUDAStream();
   rmsnormKernel<T><<<grid, block, 0, stream>>>(
