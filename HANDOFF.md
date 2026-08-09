@@ -1,6 +1,6 @@
 # JoyAI Video Edit ROCm/gfx950 handoff
 
-Prepared 2026-08-07 from upstream commit
+Prepared 2026-08-08 from upstream commit
 `231aab0d32f62fefc853cf9a046b8f29b4a39dfd`.
 
 This branch contains the ROCm/gfx950 port, native wave64
@@ -54,13 +54,22 @@ Completed and validated on an MI350X (`gfx950`):
 - Correct 720x1248 VAE warmup geometry and removal of redundant streaming VAE
   work, scheduler/device synchronization, repeated RGB/JPEG conversions, and
   per-stage synchronization.
+- Long-motion ghosting fix: the permanent global-sink chunk stores clean K/V
+  at all 40 layers, while later bounded tail chunks use a 24-layer clean
+  refresh. Periodic sink replacement, temporal-ID capping, and motion-based
+  stale-tail reuse are disabled by default because each could preserve an old
+  pose.
+- Extreme full-frame discontinuities are detected with a small luma MAD. The
+  old causal pipeline is quiesced, its pre-cut partial chunk is padded and
+  drained in order, and the cut frame becomes a clean one-frame sink. A failed
+  teardown never creates an overlapping replacement session.
 - Direct H.264/JPEG delivery, single-consumer ordered output, a locked PyAV
   encoder lifecycle, bounded result backpressure, safer worker shutdown, and
   output-pump error handling.
-- A serialized single-GPU submission path, which is the qualified default.
-  Experimental event-ordered stage streams remain available with
-  `JOYOMNI_EXPLICIT_STREAMS=1`, but are not enabled by default because compiled
-  stateful VAE execution was not reliable on non-default streams.
+- Event-ordered encode, DiT, decode, pseudo-encode, and postprocess streams on
+  one physical GPU. The qualified pseudo-context VAE path avoids the compiled
+  stateful VAE replay issue, and independent per-session GPU generators make
+  its asynchronous VAE sampling deterministic.
 - Static/unit/protocol checks and native op parity/shape sweeps.
 
 Destination-host qualification is complete. The qualification machine had
@@ -70,14 +79,19 @@ No physical index, UUID, PCI address, or host path is a deployment requirement.
 The full model uses about 88 GiB of that GPU's HBM and does not offload model
 work to the CPU.
 
-The final qualified live preset uses two denoising steps, an 18-layer clean K/V
-refresh, `--no-use-pe`, `--max-temporal-ids 8`, `--no-online-gate`, and no
-session recording. It passed a 60-second 1248x720 HTTPS/WSS H.264 run at 24.0
-input and decoded output FPS with zero protocol/decode errors, zero
-backpressure skips, no scheduled drops, and no pending frames. Mean/p95 server
-chunk time was 300.7/310.7 ms, mean/p95 end-to-end latency was 567.9/696.0 ms,
-and the largest packet gap was 375.8 ms, within the browser's adaptive one-second
-decoded-frame buffer. The slower exact all-40-layer clean-cache policy produced
+The final qualified live preset uses two denoising steps, exact all-layer clean
+K/V for the one permanent sink, a 24-layer clean refresh for later chunks,
+window-relative temporal IDs, `--kv-reset-frames 0`,
+`--no-freeze-kv-on-static`, `--scene-cut-threshold 25`, `--no-use-pe`,
+`--no-online-gate`, and no session recording. Its 60-second 1248x720 H.264 run
+accepted and acknowledged all 1,440 inputs at 24.0 FPS with zero
+protocol/decode errors, zero backpressure skips, zero scheduled drops, and a
+maximum pending depth of four frames. It returned all 1,433 frames belonging
+to complete temporal chunks (23.883 source-window FPS; the final seven inputs
+remain an intentionally incomplete chunk). Mean/p95 server chunk residence was
+431.8/515.0 ms, mean/p95 end-to-end latency was 681.1/855.8 ms, and the largest
+packet gap was 435.4 ms, within the browser's adaptive one-second decoded-frame
+buffer. The slower policy that refreshes all 40 layers on every chunk produced
 about 18.7 FPS and therefore does not meet the 24 FPS live acceptance target.
 
 ## 1. Create the ROCm environment
@@ -195,17 +209,20 @@ env -u HIP_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES \
     --height 720 --width 1248 \
     --num-inference-steps 2 \
     --no-use-pe \
-    --max-temporal-ids 8 \
-    --no-online-gate \
-    --profile-timings
+    --exact-global-sink-kv \
+    --kv-reset-frames 0 \
+    --no-freeze-kv-on-static \
+    --scene-cut-threshold 25 \
+    --no-online-gate
 ```
 
 All DiT, text-encoder, VAE encode/decode/pseudo roles, and postprocessing stay
 on the selected GPU. The first launch compiles/autotunes kernels; retain
 `deploy/deps/cache` after a successful warmup. On gfx950 the launcher defaults
-to the qualified stateful-VAE, serialized-stream,
-hybrid-KV preset (`JOYOMNI_CACHE_LAST_DENOISE_KV=1` and
-`JOYOMNI_CLEAN_KV_PREFIX_LAYERS=18`). Set
+to the qualified pseudo-context VAE, event-ordered single-GPU stream,
+hybrid-KV preset (`JOYOMNI_STATEFUL_VAE=0`,
+`JOYOMNI_EXPLICIT_STREAMS=1`, `JOYOMNI_CACHE_LAST_DENOISE_KV=1`, and
+`JOYOMNI_CLEAN_KV_PREFIX_LAYERS=24`). Set
 `JOYOMNI_CACHE_LAST_DENOISE_KV=0` for the slower exact all-layer cache policy.
 
 Check health locally:
@@ -228,9 +245,12 @@ python deploy/benchmark_streaming.py \
   --url "ws://${SERVICE_HOST}:${SERVICE_PORT}/ws" \
   --width 1248 --height 720 --fps 24 \
   --num-inference-steps 2 \
-  --max-temporal-ids 8 \
-  --cache-last-denoise-kv --clean-kv-prefix-layers 18 \
-  --warmup-seconds 10 --measure-seconds 60 \
+  --exact-global-sink-kv \
+  --kv-reset-frames 0 \
+  --no-freeze-kv-on-static --scene-cut-threshold 25 \
+  --cache-last-denoise-kv --clean-kv-prefix-layers 24 \
+  --no-profile-timings \
+  --warmup-seconds 0 --measure-seconds 60 \
   --output-json "$ARTIFACT_ROOT/streaming.json"
 ```
 
@@ -238,8 +258,12 @@ The UI is capped at 24 FPS. The live acceptance gate is sustained decoded
 output of at least 23.5 FPS for 60 seconds at 1248x720 and two denoising steps,
 with no protocol/decode errors or sustained queue/drop growth. The local
 validation artifact (intentionally excluded from Git) is
-`$ARTIFACT_ROOT/streaming-continuity-https-h264-60s.json`: 24.0 decoded FPS,
-zero errors/drops/skips, and bounded queues over the 60-second measurement.
+`$ARTIFACT_ROOT/sdpa-scene-reset-prefix24-60s.json`: 24.0 input FPS and 23.883
+source-window output FPS, zero errors/drops/skips, and bounded queues over the
+60-second measurement.
+Application stage timing is deliberately disabled for this acceptance run;
+`--profile-timings` inserts cross-thread GPU events and is intended only for a
+separate diagnostic run, not user-facing continuity or throughput numbers.
 
 ## 5. Profile after warmup
 
@@ -258,7 +282,7 @@ env -u HIP_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES \
     --stats --group-by-queue --selected-regions -f csv \
     -d "$ARTIFACT_ROOT/rocprof" -- \
     bash deploy/run_server.sh --height 720 --width 1248 \
-      --num-inference-steps 2 --no-use-pe --max-temporal-ids 8 \
+      --num-inference-steps 2 --no-use-pe \
       --no-online-gate --profile-timings
 ```
 
@@ -266,11 +290,65 @@ The baseline full-model trace recorded 392,998 dispatches, all on the selected
 gfx950 agent. Kernel time was dominated by FP8 GEMM (~23%), VAE convolution
 (~22.5%), attention (~12.4%), and other GEMM (~9.5%); device-copy time was
 negligible. It also proved that the original worker threads shared one default
-stream. Explicit event-ordered streams were implemented and tested from that
-evidence, but did not improve the qualified workload; the ROCm preset therefore
-uses serialized default-stream submission.
+stream. The final pseudo-context path uses explicit event-ordered stage streams
+on that same physical GPU; events preserve dependencies without model
+offloading or multi-GPU execution.
 
-## 6. Remote browser access
+## 6. Long-motion quality and attention follow-up
+
+The ghosting regression was reproduced with the high-motion final 15 seconds
+of the original reference demo:
+`https://github.com/user-attachments/assets/bca232c9-75df-46f9-b366-14cfa2651994`.
+The old hybrid policy left the permanent sink's later layers at a noisy denoise
+state forever. A false-static decision could then reuse that pose as another
+tail anchor. The final policy stores the sink from the clean latent at all
+layers exactly once, refreshes 24 leading layers for bounded tail chunks, and
+disables periodic reset, temporal-ID capping, and stale-tail freezing.
+
+The apparent catastrophic trail at source frame 32 was separately identified
+as an actual presentation cut: 64x36 luma MAD jumps to 56.59 between frames 31
+and 32, while ordinary high motion in the rest of the clip stays below 7.5.
+Feeding the cut through an old causal chunk creates the expected double
+exposure, including with BF16 image projections and JPEG transport. The final
+cut path instead drained source frames 0-31, inserted one duplicate of frame 31
+to complete the temporal chunk, and generated frame 32 from a fresh sink. The
+full 360-input qualification saw exactly this one cut, no false resets, no
+drops or codec errors, and a largest output gap of 864.1 ms, still below the
+default one-second browser buffer.
+
+The final 24-layer capture had 353 unique mapped outputs through source index
+352; the last seven source frames intentionally remain an incomplete live
+chunk. Over adjacent moving pairs, optical-flow EPE was 0.587826 px, flow
+cosine 0.859630, motion-compensated luma L1 0.018673, and stale-edge rate
+0.031510. Relative to the otherwise identical 18-layer capture, the 24-layer
+setting improved flow cosine (0.844737 to 0.859630), p95 stale-edge rate
+(0.083503 to 0.079524), and luma L1 (0.018741 to 0.018673), with a small EPE
+tradeoff (0.583516 to 0.587826). It was selected because the 60-second test
+proved that the additional exact refresh still met the live throughput gate.
+The official demo's edited side has different rendering and crop geometry, so
+it was used as a visual target rather than as uncalibrated pixel/flow ground
+truth. Use `deploy/analyze_streaming_quality.py` to reproduce the temporal
+analysis from a benchmark packet capture.
+
+ROCm/AITER PR #4627 was retested at commit
+`41c4093bc92531c83959cae481a1445a615ff2af`. Its current gfx950 MHA v4 path is
+dense and quantized; the PR documentation defers sparse kernels. Focused
+upstream tests passed 34 cases and failed the two FP4-value compile-parity
+cases, so those formats were excluded. On real JoyAI activations,
+INT8-Q/K+FP8-V passed the per-layer gate at observed `Q=3467` and growing K/V
+lengths, while MXFP6/FP8 failed early-layer tail-cosine gates.
+
+The decisive end-to-end test included JoyAI's non-contiguous Q/K/V views, a
+native wave64 quantizer, packing, and the AITER launch at `Q=3467`, 32 heads,
+head dimension 128, and K/V lengths 3467 through 11267. The AITER kernel alone
+was 1.61-1.91x faster than SDPA, but the complete path was only 0.678-0.974x
+SDPA and never won at any tested length. Transformer-like inputs also missed
+the accuracy gate (roughly 0.9983 global cosine and 0.058 relative L2), with
+sink-heavy inputs worse. AITER was therefore rejected for production; the
+qualified backend remains PyTorch ROCm SDPA (AOTriton/CK dispatch). No AITER
+runtime dependency or experimental attention code is required by this branch.
+
+## 7. Remote browser access
 
 The browser captures its own camera with `getUserMedia` and sends WebCodecs
 H.264 (JPEG fallback) over WebSocket; this is not WebRTC and the server does not
@@ -313,7 +391,7 @@ repository configuration; do not record an ephemeral tunnel URL in this file.
 
 ## Validation record
 
-Native extension validation completed before the machine became contended:
+Native and runtime validation record:
 
 - gfx950 build and hipify succeeded with zero unsupported CUDA calls.
 - RMSNorm, layernorm/modulation, and Q/K+RoPE parity passed in float32, float16,
@@ -328,6 +406,6 @@ Native extension validation completed before the machine became contended:
 - Static Python compilation, focused CPU units, scheduler parity, PyAV H.264
   round trips, mocked WebSocket flow, bounded-queue behavior, and concurrent
   encoder lifecycle tests passed.
-- Full warmup, the 60-second live benchmark, a full selected-region rocprof
-  capture, and a public HTTPS/WSS protocol run all completed successfully on
-  the destination host.
+- Full warmup, the prefix-24 60-second live benchmark, the 360-input motion/cut
+  capture, a full selected-region rocprof capture, and a controlled HTTPS/WSS
+  protocol run all completed successfully on the destination host.

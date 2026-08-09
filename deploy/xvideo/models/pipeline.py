@@ -280,6 +280,7 @@ class Pipeline(DiffusionPipeline):
         *,
         enable_denormalization: bool,
         last_only: bool = False,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         is_causal = getattr(self.transformer.config, "causal", False)
         dit_chunk_size = getattr(self.transformer.config, "chunk_size", None)
@@ -308,6 +309,7 @@ class Pipeline(DiffusionPipeline):
                 h = self._encode_vae_single(
                     inputs,
                     enable_denormalization=enable_denormalization,
+                    generator=generator,
                 )
                 return h[:, :, -1:]
 
@@ -324,18 +326,27 @@ class Pipeline(DiffusionPipeline):
                         pad = inputs[:, :, :1].expand(-1, -1, pad_needed, -1, -1)
                         window = torch.cat([pad, window], dim=2)
 
-                h = self._encode_vae_single(window, enable_denormalization=enable_denormalization)
+                h = self._encode_vae_single(
+                    window,
+                    enable_denormalization=enable_denormalization,
+                    generator=generator,
+                )
                 lat_list.append(h[:, :, -1:])
 
             return torch.cat(lat_list, dim=2)
 
-        return self._encode_vae_single(inputs, enable_denormalization=enable_denormalization)
+        return self._encode_vae_single(
+            inputs,
+            enable_denormalization=enable_denormalization,
+            generator=generator,
+        )
 
     def _encode_vae_single(
         self,
         inputs: torch.Tensor,
         *,
         enable_denormalization: bool,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         original_device = inputs.device
         inputs = inputs.to(self.vae.device)
@@ -343,7 +354,7 @@ class Pipeline(DiffusionPipeline):
         from xvideo.models.vae import vae_compile as _vc
         inputs = _vc.prep_input(inputs)
 
-        latents = self.vae.encode(inputs).latent_dist.sample()
+        latents = self.vae.encode(inputs).latent_dist.sample(generator=generator)
         if enable_denormalization:
             latents = self.normalize_latents(latents)
         return latents.to(original_device)

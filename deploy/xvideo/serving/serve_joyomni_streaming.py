@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 import uvicorn
 
 from xvideo.serving.pe import DEFAULT_MODEL as DEFAULT_PE_MODEL
@@ -759,6 +759,14 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         try:
             if args.preload:
                 runtime = get_runtime()
+                # Ultralytics adjusts PyTorch's process-wide CPU thread count
+                # while loading. Dynamo includes that global state in compiled
+                # VAE guards, so warming the detector *after* the video graphs
+                # invalidated them and made the first real session spend
+                # 10-20 seconds recompiling. Establish the final global state
+                # first, then warm the live pipeline on the persistent submit
+                # thread.
+                _warm_person_detector(args)
                 # Live frame submission must stay on one persistent host
                 # thread. Warming on the main thread and then entering ROCm
                 # through arbitrary asyncio-pool threads caused a one-time
@@ -769,11 +777,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     width=args.width,
                     prompt=args.prompt,
                     num_inference_steps=args.num_inference_steps,
-                    max_temporal_ids=(
-                        args.max_temporal_ids
-                        if args.max_temporal_ids is not None
-                        else 8
-                    ),
+                    max_temporal_ids=args.max_temporal_ids,
                     freeze_kv_on_static=args.freeze_kv_on_static,
                     static_diff_thresh=args.static_diff_thresh,
                 )
@@ -781,7 +785,6 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     _app.state.frame_executor,
                     live_warmup,
                 )
-                _warm_person_detector(args)
             yield
         finally:
             await asyncio.to_thread(
@@ -818,10 +821,12 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "person_count_reedit": args.person_count_reedit,
             "require_face": args.require_face,
             "static_diff_thresh": args.static_diff_thresh,
+            "scene_cut_threshold": args.scene_cut_threshold,
             "freeze_kv_on_static": args.freeze_kv_on_static,
             "profile_timings": args.profile_timings,
             "use_pe": args.use_pe,
             "max_temporal_ids": args.max_temporal_ids,
+            "exact_global_sink_kv": args.exact_global_sink_kv,
 
             "record_enabled": bool(args.record_dir),
         }
@@ -865,8 +870,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "pe_model": args.pe_model or DEFAULT_PE_MODEL,
                 "kv_reset_frames": args.kv_reset_frames,
                 "max_temporal_ids": args.max_temporal_ids,
+                "exact_global_sink_kv": args.exact_global_sink_kv,
                 "freeze_kv_on_static": args.freeze_kv_on_static,
                 "static_diff_thresh": args.static_diff_thresh,
+                "scene_cut_threshold": args.scene_cut_threshold,
             }
         )
 
@@ -985,6 +992,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         max_temporal_ids = args.max_temporal_ids
         freeze_kv_on_static = args.freeze_kv_on_static
         static_diff_thresh = args.static_diff_thresh
+        scene_cut_threshold = max(0.0, float(args.scene_cut_threshold))
         frames_since_session_reset = 0
         reset_count = 0
         next_frame_meta: dict[str, Any] | None = None
@@ -1029,6 +1037,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "max_temporal_ids": max_temporal_ids,
             "freeze_kv_on_static": freeze_kv_on_static,
             "static_diff_thresh": static_diff_thresh,
+            "scene_cut_threshold": scene_cut_threshold,
+            "scene_cut_count": 0,
+            "scene_cut_last_mad": None,
             "kv_reset_count": reset_count,
             "frames_since_session_reset": frames_since_session_reset,
             "send_state": "idle",
@@ -1414,19 +1425,30 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 )
             return None
 
-        def _close_session_sync(session_ref) -> None:
-            session_ref.close()
+        def _close_session_sync(session_ref, flush_pending: bool):
+            padded_source_frames = 0
+            if flush_pending:
+                padded_source_frames = session_ref.flush_pending_for_reset()
+            completed = session_ref.close()
+            return padded_source_frames, completed
 
-        async def _close_session_safely(session_ref, reason: str) -> None:
+        async def _close_session_safely(
+            session_ref,
+            reason: str,
+            *,
+            flush_pending: bool = False,
+        ) -> tuple[bool, int, list[Any]]:
             try:
-                await asyncio.wait_for(
+                padded_source_frames, completed = await asyncio.wait_for(
                     loop.run_in_executor(
                         app.state.frame_executor,
                         _close_session_sync,
                         session_ref,
+                        flush_pending,
                     ),
                     timeout=max(0.1, float(args.session_close_timeout_s)),
                 )
+                return True, int(padded_source_frames), list(completed)
             except asyncio.TimeoutError:
                 ws_debug["close_timeout"] = reason
                 print(
@@ -1434,9 +1456,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     f"{args.session_close_timeout_s:.1f}s reason={reason}",
                     flush=True,
                 )
+                return False, 0, []
             except Exception as exc:
                 ws_debug["close_error"] = repr(exc)
                 print(f"#####[WS-GUARD] session close failed reason={reason}: {exc!r}", flush=True)
+                return False, 0, []
 
         async def _stop_output_task() -> None:
             nonlocal output_task
@@ -1538,7 +1562,25 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 return
 
             await _stop_output_task()
-            await _close_session_safely(session, "kv_reset")
+            closed, padded_source_frames, completed = await _close_session_safely(
+                session,
+                reason,
+                flush_pending=(reason == "scene_cut"),
+            )
+            if not closed:
+                # wait_for cannot stop a native worker that is already inside
+                # a HIP call.  Never create a second session over model state
+                # which the timed-out close may still be mutating.
+                raise RuntimeError(f"could not safely reset session ({reason})")
+
+            # The output pump is deliberately stopped before close so it
+            # cannot race the stateful encoder.  close() returns every result
+            # produced while its workers drain; preserve their order on the
+            # wire before beginning the new causal scene.
+            for result in completed:
+                await _send_chunk_result(result)
+            if padded_source_frames:
+                ws_debug["scene_cut_flushed_source_frames"] = padded_source_frames
             reset_count += 1
             session = _create_session()
             app.state.active_session = session
@@ -1555,6 +1597,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     "max_temporal_ids": max_temporal_ids,
                     "freeze_kv_on_static": freeze_kv_on_static,
                     "static_diff_thresh": static_diff_thresh,
+                    "scene_cut_threshold": scene_cut_threshold,
                     "frames_per_next_chunk": session.frames_per_next_chunk,
                 }
             )
@@ -1616,7 +1659,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                             print("#####[RESTART] tearing down prior session: stop_output_task", flush=True)
                             await _stop_output_task()
                             print("#####[RESTART] close_session", flush=True)
-                            await _close_session_safely(session, "restart")
+                            closed, _, _ = await _close_session_safely(session, "restart")
+                            if not closed:
+                                await _send_json(
+                                    {
+                                        "type": "error",
+                                        "message": "prior session did not close safely",
+                                    }
+                                )
+                                break
                             print("#####[RESTART] prior session closed OK", flush=True)
                             if getattr(app.state, "active_session", None) is session:
                                 app.state.active_session = None
@@ -1645,6 +1696,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         )
                         static_diff_thresh = float(
                             payload.get("static_diff_thresh", args.static_diff_thresh)
+                        )
+                        scene_cut_threshold = max(
+                            0.0,
+                            float(payload.get("scene_cut_threshold", args.scene_cut_threshold)),
                         )
                         use_pe = bool(payload.get("use_pe", args.use_pe))
 
@@ -1685,6 +1740,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         gate_state["recount"] = False
                         gate_state["settle_gray"] = None
                         gate_state["pe_anchor"] = None
+                        gate_state["scene_gray"] = None
                         gate_state["settle_ax"] = None
                         gate_state["settle_ay"] = None
                         person_monitor_epoch += 1
@@ -1734,6 +1790,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                                 if "clean_kv_prefix_layers" in payload
                                 else None
                             ),
+                            exact_global_sink_kv=(
+                                bool(payload["exact_global_sink_kv"])
+                                if "exact_global_sink_kv" in payload
+                                else bool(args.exact_global_sink_kv)
+                            ),
                             profile_timings=bool(payload.get("profile_timings", args.profile_timings)),
                         )
 
@@ -1749,6 +1810,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         ws_debug["max_temporal_ids"] = max_temporal_ids
                         ws_debug["freeze_kv_on_static"] = freeze_kv_on_static
                         ws_debug["static_diff_thresh"] = static_diff_thresh
+                        ws_debug["scene_cut_threshold"] = scene_cut_threshold
+                        ws_debug["scene_cut_count"] = 0
+                        ws_debug["scene_cut_last_mad"] = None
                         ws_debug["kv_reset_count"] = reset_count
                         ws_debug["frames_since_session_reset"] = frames_since_session_reset
                         ws_debug["has_ref_image"] = ref_image is not None
@@ -1799,8 +1863,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                                 "use_pe": use_pe,
                                 "pe_model": args.pe_model or DEFAULT_PE_MODEL,
                                 "max_temporal_ids": max_temporal_ids,
+                                "exact_global_sink_kv": session_settings.exact_global_sink_kv,
                                 "freeze_kv_on_static": freeze_kv_on_static,
                                 "static_diff_thresh": static_diff_thresh,
+                                "scene_cut_threshold": scene_cut_threshold,
                                 "uplink_codec": uplink_codec,
                                 "downlink_codec": downlink_codec,
                             }
@@ -1945,6 +2011,33 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         frame = _decode_uplink(frame_bytes)
                     if frame is None:
                         return None
+
+                    # A causal one-latent/8-frame chunk will deliberately
+                    # blend history across an abrupt edit or camera-source
+                    # switch. Detect only extreme full-frame discontinuities
+                    # here; ordinary body/camera motion in the qualification
+                    # clip stays far below this MAD threshold. The event-loop
+                    # path recreates the bounded streaming state and replays
+                    # this frame as the new one-frame sink.
+                    if scene_cut_threshold > 0.0:
+                        scene_gray = frame.convert("L").resize(
+                            (64, 36), Image.Resampling.BILINEAR
+                        )
+                        previous_scene_gray = gate_state.get("scene_gray")
+                        gate_state["scene_gray"] = scene_gray
+                        if previous_scene_gray is not None:
+                            scene_mad = float(
+                                ImageStat.Stat(
+                                    ImageChops.difference(previous_scene_gray, scene_gray)
+                                ).mean[0]
+                            )
+                            ws_debug["scene_cut_last_mad"] = scene_mad
+                            if (
+                                scene_mad >= scene_cut_threshold
+                                and not face_gate_pending
+                                and bool(getattr(session, "initialized", False))
+                            ):
+                                return ("__scene_cut__", frame, frame_meta, scene_mad)
 
                     if face_gate_pending:
                         if True:
@@ -2199,6 +2292,57 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 )
                 if chunk_results is None:
                     continue
+                if (
+                    isinstance(chunk_results, tuple)
+                    and chunk_results
+                    and chunk_results[0] == "__scene_cut__"
+                ):
+                    _, cut_frame, cut_meta, scene_mad = chunk_results
+                    ws_debug["scene_cut_count"] = int(
+                        ws_debug.get("scene_cut_count", 0)
+                    ) + 1
+                    ws_debug["scene_cut_last_mad"] = float(scene_mad)
+                    print(
+                        f"#####[SCENE-CUT] MAD={float(scene_mad):.2f} >= "
+                        f"{scene_cut_threshold:.2f}; resetting causal state",
+                        flush=True,
+                    )
+                    await _reset_session("scene_cut")
+                    reset_session = session
+
+                    def _replay_scene_cut_frame():
+                        acquired = app.state.inference_lock.acquire(
+                            timeout=max(0.1, float(args.inference_lock_timeout_s))
+                        )
+                        if not acquired:
+                            raise TimeoutError(
+                                "inference lock timeout while replaying scene-cut frame"
+                            )
+                        try:
+                            return reset_session.push_frame(
+                                cut_frame,
+                                frame_meta=cut_meta,
+                                drain_results=False,
+                            )
+                        finally:
+                            app.state.inference_lock.release()
+
+                    try:
+                        chunk_results = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                app.state.frame_executor,
+                                _replay_scene_cut_frame,
+                            ),
+                            timeout=max(0.1, float(args.push_frame_timeout_s)),
+                        )
+                    except Exception as exc:
+                        await _send_json(
+                            {
+                                "type": "error",
+                                "message": f"scene-cut replay failed: {exc!r}",
+                            }
+                        )
+                        break
                 if isinstance(chunk_results, tuple) and chunk_results and isinstance(chunk_results[0], str):
                     sentinel = chunk_results[0]
                     if sentinel == "__no_person__":
@@ -2394,10 +2538,20 @@ def parse_args() -> argparse.Namespace:
                         help="Framerate hint for the downlink H.264 encoder (affects GOP/keyframe interval only).")
     parser.add_argument("--prompt", type=str, default="Keep the person and scene temporally consistent while applying the requested edit.")
     parser.add_argument("--profile-timings", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--kv-reset-frames", type=int, default=1080)
+    parser.add_argument("--kv-reset-frames", type=int, default=0, help="Recreate streaming state every N input frames; 0 (default) keeps the bounded cache continuous and avoids promoting an in-motion frame to a new global sink.")
     parser.add_argument("--max-temporal-ids", type=int, default=None)
-    parser.add_argument("--freeze-kv-on-static", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--freeze-kv-on-static", action=argparse.BooleanOptionalAction, default=False, help="Experimental stale-tail anchor reuse. Disabled by default because false-static decisions cause visible pose ghosting and do not reduce model work.")
     parser.add_argument("--static-diff-thresh", type=float, default=0.5)
+    parser.add_argument(
+        "--scene-cut-threshold",
+        type=float,
+        default=25.0,
+        help=(
+            "Reset causal state when consecutive 64x36 luma frames exceed this "
+            "mean absolute difference; 0 disables hard-cut detection."
+        ),
+    )
+    parser.add_argument("--exact-global-sink-kv", action=argparse.BooleanOptionalAction, default=True, help="Store all layers of the permanent global-sink chunk from the final clean latent once; later bounded tail chunks retain the fast hybrid policy.")
     parser.add_argument("--preload", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--push-frame-timeout-s", type=float, default=60.0, help="Max seconds a single frame submission may block before releasing the WS session gate. The default covers one-time ROCm graph specialization; steady-state submissions remain sub-second.")
     parser.add_argument("--session-close-timeout-s", type=float, default=5.0, help="Best-effort session cleanup timeout during WS teardown.")

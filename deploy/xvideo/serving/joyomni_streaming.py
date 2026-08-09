@@ -91,6 +91,7 @@ class StreamingSettings:
     store_clean_self_only: bool = True
     cache_last_denoise_kv: bool | None = None
     clean_kv_prefix_layers: int | None = None
+    exact_global_sink_kv: bool = True
     profile_timings: bool = False
 
 @dataclass
@@ -476,8 +477,22 @@ class JoyOmniV2VStreamingSession:
             )
         if not self._cache_last_denoise_kv:
             self._clean_kv_prefix_layers = 0
+        self._exact_global_sink_kv = bool(settings.exact_global_sink_kv)
         self.device = self.pipeline.transformer.device
         self.generator = torch.Generator(device=self.device).manual_seed(settings.seed)
+        # Do not draw VAE noise from the process-global generator. Encode and
+        # pseudo-encode can execute on independent GPU streams, and their
+        # scheduling order must not change the latent sequence for a fixed
+        # session seed.
+        seed_modulus = (1 << 63) - 1
+        encode_seed = (int(settings.seed) + 1) % seed_modulus
+        pseudo_seed = (int(settings.seed) + 2) % seed_modulus
+        self._vae_encode_generator = torch.Generator(
+            device=_module_device(self.pipeline.vae)
+        ).manual_seed(encode_seed)
+        self._vae_pseudo_generator = torch.Generator(
+            device=_module_device(self.pseudo_encode_vae)
+        ).manual_seed(pseudo_seed)
 
         self._prev_static_gray: np.ndarray | None = None
         self._static_anchor_id: int | None = None
@@ -736,13 +751,42 @@ class JoyOmniV2VStreamingSession:
         self._raise_worker_error_if_needed()
         return results
 
-    def close(self) -> None:
+    def flush_pending_for_reset(self) -> int:
+        """Submit a final padded chunk before an intentional state reset.
+
+        A cut can arrive after one to seven pre-cut frames have accumulated.
+        Dropping those frames creates a visible hole in the downlink.  Pad the
+        partial chunk with its final pre-cut frame so the causal VAE never sees
+        the new scene, while allowing the client to play every accepted frame
+        (plus less than one padded chunk at the boundary).
+        """
+        self._raise_worker_error_if_needed()
+        if not self.initialized or not self.pending_frames:
+            return 0
+
+        source_count = len(self.pending_frames)
+        chunk_frames = list(self.pending_frames)
+        chunk_metas = list(self.pending_metas)
+        self.pending_frames.clear()
+        self.pending_metas.clear()
+
+        final_frame = chunk_frames[-1]
+        final_meta = chunk_metas[-1] if chunk_metas else {}
+        while len(chunk_frames) < self.ffactor_t:
+            chunk_frames.append(final_frame)
+            chunk_metas.append(dict(final_meta))
+
+        self._submit_or_process_chunk(chunk_frames, chunk_metas)
+        return source_count
+
+    def close(self) -> list[StreamingChunkResult]:
         # Quiesce the pipeline before mutating feature/KV caches.  Workers may
         # still be draining queued chunks during warmup, restart, or a client
         # disconnect; clearing live cache state races their model forwards.
-        self._stop_async_workers()
+        completed = self._stop_async_workers()
         self._clear_vae_feature_caches()
         self.pipeline.transformer.reset_inference_kv_cache()
+        return completed
 
     @torch.no_grad()
     def _initialize(self, first_frame: Image.Image) -> None:
@@ -824,17 +868,23 @@ class JoyOmniV2VStreamingSession:
         if self.enable_denormalization:
             encoded = _vc.encode_via_dynamic(self.pipeline.vae, ref_img_encoded)
             if hasattr(encoded, "latent_dist"):
-                ref_img_latent = encoded.latent_dist.sample()
+                ref_img_latent = encoded.latent_dist.sample(
+                    generator=self._vae_encode_generator
+                )
                 ref_img_latent = self.pipeline.normalize_latents(ref_img_latent)
             elif torch.is_tensor(encoded):
                 posterior = self.pipeline.vae.encode(ref_img_encoded, return_posterior=True)
-                ref_img_latent = self.pipeline.normalize_latents(posterior.sample())
+                ref_img_latent = self.pipeline.normalize_latents(
+                    posterior.sample(generator=self._vae_encode_generator)
+                )
             else:
                 raise TypeError(f"Unsupported VAE encode output type for ref image: {type(encoded)}")
         else:
             ref_img_latent = _vc.encode_via_dynamic(self.pipeline.vae, ref_img_encoded)
             if hasattr(ref_img_latent, "latent_dist"):
-                ref_img_latent = ref_img_latent.latent_dist.sample()
+                ref_img_latent = ref_img_latent.latent_dist.sample(
+                    generator=self._vae_encode_generator
+                )
             if not torch.is_tensor(ref_img_latent):
                 raise TypeError(f"Unsupported VAE encode output type for ref image: {type(ref_img_latent)}")
 
@@ -899,9 +949,16 @@ class JoyOmniV2VStreamingSession:
             "stateful_vae": int(self.stateful_vae),
             "kv_store_strategy": (
                 (
-                    f"last_denoise_clean_prefix_{self._clean_kv_prefix_layers}"
+                    (
+                        f"last_denoise_clean_prefix_{self._clean_kv_prefix_layers}"
+                        + ("_exact_global_sink" if self._exact_global_sink_kv else "")
+                    )
                     if self._clean_kv_prefix_layers
-                    else "last_denoise_approx"
+                    else (
+                        "last_denoise_approx_exact_global_sink"
+                        if self._exact_global_sink_kv
+                        else "last_denoise_approx"
+                    )
                 )
                 if self._cache_last_denoise_kv
                 else "clean_exact"
@@ -912,6 +969,21 @@ class JoyOmniV2VStreamingSession:
             "vae_pseudo_device": str(_module_device(self.pseudo_encode_vae)),
             "postprocess_device": str(self.postprocess_device),
         }
+
+    def _clean_kv_store_plan(self, active_chunk_id: int) -> tuple[int, bool]:
+        """Return the exact clean-store depth and whether this is the sink refresh."""
+        exact_global_sink = bool(
+            self._cache_last_denoise_kv
+            and self._exact_global_sink_kv
+            and self.global_sink_chunk
+            and active_chunk_id == 0
+        )
+        layers = (
+            len(self.pipeline.transformer.double_blocks)
+            if exact_global_sink
+            else self._clean_kv_prefix_layers
+        )
+        return int(layers), exact_global_sink
 
     def _denoise_chunk(
         self,
@@ -1050,8 +1122,16 @@ class JoyOmniV2VStreamingSession:
         if self._cache_last_denoise_kv:
             # The active cache was written as part of the last denoise forward.
             # Optionally overwrite an exact prefix from the final clean latent;
-            # untouched later layers retain their last-denoise entries.
-            if self._clean_kv_prefix_layers:
+            # untouched later layers retain their last-denoise entries. Chunk 0
+            # is different: global-sink attention retains it for the entire
+            # session, so leaving its later layers at a noisy denoise state
+            # permanently injects the first pose and accumulates ghosting. Pay
+            # for one full clean store at startup; tail chunks remain hybrid
+            # and are evicted after the bounded local window advances.
+            clean_store_layers, exact_global_sink = self._clean_kv_store_plan(active_chunk_id)
+            profile["clean_kv_store_layers"] = int(clean_store_layers)
+            profile["exact_global_sink_refresh"] = int(exact_global_sink)
+            if clean_store_layers:
                 started = self._timer_start(self.device, use_cuda_event=False)
                 self._timer_record(profile, "kv_store_setup_s", started)
                 started = self._timer_start(self.device)
@@ -1068,7 +1148,7 @@ class JoyOmniV2VStreamingSession:
                     pre_rope=True,
                     cached_temporal_ids=None,
                     store_mode="store",
-                    store_prefix_layers=self._clean_kv_prefix_layers,
+                    store_prefix_layers=clean_store_layers,
                 )
                 self._timer_record(profile, "kv_store_forward_s", started)
             # `_evict_after_store` immediately applies the next-window policy.
@@ -1208,9 +1288,9 @@ class JoyOmniV2VStreamingSession:
         for worker in self._workers:
             worker.start()
 
-    def _stop_async_workers(self) -> None:
+    def _stop_async_workers(self) -> list[StreamingChunkResult]:
         if self._encode_queue is None:
-            return
+            return []
         try:
             self._encode_queue.put(None, timeout=0.1)
         except queue.Full:
@@ -1221,6 +1301,7 @@ class JoyOmniV2VStreamingSession:
         # Worker functions enqueue asynchronously.  Quiesce every stage before
         # close() clears model feature/KV caches or releases queued tensors.
         self._synchronize_stage_devices()
+        completed = self._drain_async_results()
         self._encode_queue = None
         self._dit_queue = None
         self._decode_queue = None
@@ -1228,6 +1309,7 @@ class JoyOmniV2VStreamingSession:
         self._postprocess_queue = None
         self._result_queue = None
         self._workers = []
+        return completed
 
     def _set_worker_error(self, exc: BaseException) -> None:
         import traceback as _tb
@@ -1673,7 +1755,7 @@ class JoyOmniV2VStreamingSession:
         with _enc_ctx:
             if self.stateful_vae:
                 posterior = self.pipeline.vae.encode_stream(source_window).latent_dist
-                ref_latent = posterior.sample()
+                ref_latent = posterior.sample(generator=self._vae_encode_generator)
                 if self.enable_denormalization:
                     ref_latent = self.pipeline.normalize_latents(ref_latent)
             else:
@@ -1681,6 +1763,7 @@ class JoyOmniV2VStreamingSession:
                     source_window,
                     enable_denormalization=self.enable_denormalization,
                     last_only=True,
+                    generator=self._vae_encode_generator,
                 )
         if profile is not None:
             self._timer_record(profile, "vae_encode_s", started)
@@ -1794,7 +1877,9 @@ class JoyOmniV2VStreamingSession:
         with vae_ctx:
             pseudo_enc = pseudo_vae.encode(prev_pixels)
             if hasattr(pseudo_enc, "latent_dist"):
-                pseudo_latent = pseudo_enc.latent_dist.sample()
+                pseudo_latent = pseudo_enc.latent_dist.sample(
+                    generator=self._vae_pseudo_generator
+                )
             else:
                 pseudo_latent = pseudo_enc
         self._set_debug_state("pseudo-encode", "store_pseudo_latent", chunk_idx)

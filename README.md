@@ -103,7 +103,10 @@ python -m pip install -r requirements.txt
 ROCm PyTorch environment, install `requirements-rocm.txt`, and build the gfx950
 kernels as described in [`DEPLOYMENT.md`](DEPLOYMENT.md#amd-rocm--gfx950).
 The tested MI350X live preset uses two denoising steps at 1248x720 and a
-hybrid 18-layer clean-KV refresh; see
+hybrid clean-KV policy: all 40 layers for the permanent global sink once and
+24 layers for later bounded tail chunks. A safe drain/reset keeps real scene
+cuts from being blended with prior causal state. The one-GPU preset accepts a
+steady 24 FPS while preserving every complete temporal chunk; see
 [`HANDOFF.md`](HANDOFF.md) for the exact TheRock setup, launch, benchmark, and
 rocprof commands.
 

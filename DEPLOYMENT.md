@@ -78,13 +78,16 @@ hipBLASLt/Composable Kernel path. NVIDIA flash-attn is optional; PyTorch SDPA
 selects the available ROCm AOTriton/CK backend.
 
 Select a physical AMD GPU with only `ROCR_VISIBLE_DEVICES` and continue to use
-logical `cuda:0` in PyTorch:
+logical `cuda:0` in PyTorch. Set `GPU_SELECTOR` to a free physical index or,
+preferably, its ROCr UUID:
 
 ```bash
 env -u HIP_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES \
-  ROCR_VISIBLE_DEVICES=2 JOYOMNI_DEVICE=cuda:0 \
+  ROCR_VISIBLE_DEVICES="$GPU_SELECTOR" JOYOMNI_DEVICE=cuda:0 \
   bash deploy/run_server.sh --height 720 --width 1248 \
-    --num-inference-steps 2 --no-use-pe
+    --num-inference-steps 2 --no-use-pe \
+    --exact-global-sink-kv --kv-reset-frames 0 \
+    --no-freeze-kv-on-static --scene-cut-threshold 25
 ```
 
 Do not combine the ROCr mask with `HIP_VISIBLE_DEVICES` or
@@ -116,16 +119,22 @@ should both be true on gfx950 when the native quantizer and
 `torch._scaled_mm` are available.
 
 With `ROCR_VISIBLE_DEVICES` set, the launcher selects the qualified MI350X
-preset: stateful causal VAE, serialized default-stream submission, final-denoise
-K/V reuse, and an exact 18-layer clean-KV refresh. This sustained 24 decoded
-FPS at 1248x720 with two denoising steps for 60 seconds. Set
+preset: pseudo-context causal VAE, event-ordered stage streams on one physical
+GPU, final-denoise K/V reuse, a one-time exact all-40-layer refresh for the
+permanent global sink, and a 24-layer clean refresh for later bounded tail
+chunks. It accepted 1,440 frames at 24.0 FPS and returned every complete
+temporal chunk at 23.883 source-window FPS over 60 seconds. Periodic K/V reset,
+temporal-ID capping, and experimental motion-based K/V freezing default off.
+Extreme full-frame discontinuities trigger a safe drain/reset so a hard cut is
+not blended with the prior scene. Set
 `JOYOMNI_CACHE_LAST_DENOISE_KV=0` for the slower all-40-layer exact clean-cache
-policy. `JOYOMNI_CLEAN_KV_PREFIX_LAYERS=0` selects the fastest, gentler editing
-policy; values above 18 were not real-time in the qualified workload.
+policy on every chunk. `JOYOMNI_CLEAN_KV_PREFIX_LAYERS=0` selects the fastest,
+gentler editing policy for tail chunks.
 
-`JOYOMNI_EXPLICIT_STREAMS=1` remains available for event-ordered per-stage
-streams, but `0` is the qualified gfx950 setting because rocprof showed no
-throughput benefit from the extra queues for this pipeline.
+`JOYOMNI_STATEFUL_VAE=0`, `JOYOMNI_EXPLICIT_STREAMS=1`, and
+`JOYOMNI_CLEAN_KV_PREFIX_LAYERS=24` are the qualified gfx950 defaults. All
+streams still target the one logical `cuda:0`; this is neither multi-GPU
+execution nor CPU model offload.
 
 The launcher does not contain private paths or API credentials. Activate your environment before launching, or pass the conda entrypoint through environment variables:
 
@@ -180,12 +189,13 @@ The ROCm port was additionally qualified on one AMD Instinct MI350X
 | Python / PyTorch | `3.12.3` / `2.13.0+rocm10.1.0a20260807` |
 | Triton / rocprofv3 | `3.8.0` / `1.3.5` |
 | Precision paths | BF16 activations, OCP E4M3 image projections, hipBLASLt/CK scaled GEMM, AOTriton/CK SDPA |
-| Live result | 1248x720 H.264, two denoising steps, hybrid 18-layer clean-KV refresh, 24.0 decoded FPS over 60 seconds |
+| Live result | 1248x720 H.264, two denoising steps, exact 40-layer permanent sink + 24-layer tail refresh, 24.0 input / 23.883 source-window output FPS over 60 seconds |
 
 For the qualified MI350X live preset, launch with `--num-inference-steps 2`;
-the launcher supplies the hybrid 18-layer clean-KV refresh by default on ROCm.
-The one-step preset measured 24.067 FPS, while the slower exact all-40-layer
-clean-cache policy measured about 18.7 FPS at this resolution. Full
+the launcher supplies the one-time exact global sink plus hybrid 24-layer tail
+refresh by default on ROCm. The one-step preset measured 24.067 FPS, while the
+slower policy that refreshes all 40 layers on every chunk measured about 18.7
+FPS at this resolution. Full
 reproduction commands and profiling results are in [`HANDOFF.md`](HANDOFF.md).
 
 ## 2. Clone JoyAI-Video-Edit Weights

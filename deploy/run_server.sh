@@ -47,10 +47,10 @@ export JOYOMNI_TUNABLEOP_FILE="${JOYOMNI_TUNABLEOP_FILE:-$HERE/deps/cache/tunabl
 # conservative exact-cache defaults; the ROCm launcher selects the sustained
 # two-step real-time policy validated by deploy/benchmark_streaming.py.
 if [ -n "${ROCR_VISIBLE_DEVICES:-}" ]; then
-  export JOYOMNI_STATEFUL_VAE="${JOYOMNI_STATEFUL_VAE:-1}"
-  export JOYOMNI_EXPLICIT_STREAMS="${JOYOMNI_EXPLICIT_STREAMS:-0}"
+  export JOYOMNI_STATEFUL_VAE="${JOYOMNI_STATEFUL_VAE:-0}"
+  export JOYOMNI_EXPLICIT_STREAMS="${JOYOMNI_EXPLICIT_STREAMS:-1}"
   export JOYOMNI_CACHE_LAST_DENOISE_KV="${JOYOMNI_CACHE_LAST_DENOISE_KV:-1}"
-  export JOYOMNI_CLEAN_KV_PREFIX_LAYERS="${JOYOMNI_CLEAN_KV_PREFIX_LAYERS:-18}"
+  export JOYOMNI_CLEAN_KV_PREFIX_LAYERS="${JOYOMNI_CLEAN_KV_PREFIX_LAYERS:-24}"
 fi
 
 # ---- recording ----

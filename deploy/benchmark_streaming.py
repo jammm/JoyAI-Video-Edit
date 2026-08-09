@@ -71,6 +71,16 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _crop_rect(value: str) -> tuple[int, int, int, int]:
+    try:
+        left, top, right, bottom = (int(part.strip()) for part in value.split(","))
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be LEFT,TOP,RIGHT,BOTTOM") from None
+    if left < 0 or top < 0 or right <= left or bottom <= top:
+        raise argparse.ArgumentTypeError("crop coordinates must define a positive rectangle")
+    return left, top, right, bottom
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -171,6 +181,97 @@ class MovingImageFrames:
         return np.ascontiguousarray(self._image[y:y + self.height, x:x + self.width])
 
 
+class VideoFrames:
+    """Sequentially sample a real motion clip at the benchmark frame rate."""
+
+    def __init__(
+        self,
+        path: Path,
+        width: int,
+        height: int,
+        fps: float,
+        *,
+        start_s: float = 0.0,
+        end_s: float | None = None,
+        crop: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        self._container = av.open(str(path))
+        if not self._container.streams.video:
+            self._container.close()
+            raise ValueError(f"input video has no video stream: {path}")
+        self._stream = self._container.streams.video[0]
+        self.width = width
+        self.height = height
+        self.fps = float(fps)
+        self.start_s = float(start_s)
+        self.end_s = float(end_s) if end_s is not None else None
+        self.crop = crop
+        self._last_index = -1
+        self._last_frame: np.ndarray | None = None
+        self._decoded_time = float("-inf")
+        self._decoder: Any = None
+        self._seek(self.start_s)
+
+    @staticmethod
+    def _frame_time(frame: av.VideoFrame, stream: av.VideoStream) -> float:
+        if frame.time is not None:
+            return float(frame.time)
+        if frame.pts is None:
+            raise RuntimeError("input video frame has neither time nor PTS")
+        return float(frame.pts * stream.time_base)
+
+    def _seek(self, timestamp_s: float) -> None:
+        offset = max(0, int(timestamp_s / float(self._stream.time_base)))
+        self._container.seek(offset, stream=self._stream, any_frame=False, backward=True)
+        self._decoder = iter(self._container.decode(self._stream))
+        self._decoded_time = float("-inf")
+        self._last_frame = None
+
+    def _convert(self, frame: av.VideoFrame) -> np.ndarray:
+        image = frame.to_image()
+        if self.crop is not None:
+            left, top, right, bottom = self.crop
+            if right > image.width or bottom > image.height:
+                raise ValueError(
+                    f"input crop {self.crop} exceeds decoded frame {image.width}x{image.height}"
+                )
+            image = image.crop(self.crop)
+        if image.size != (self.width, self.height):
+            image = image.resize((self.width, self.height), Image.Resampling.LANCZOS)
+        return np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
+
+    def frame(self, index: int) -> np.ndarray:
+        if index < self._last_index:
+            raise ValueError("video frame indices must be requested monotonically")
+        if index == self._last_index and self._last_frame is not None:
+            return self._last_frame
+
+        target_s = self.start_s + index / self.fps
+        if self.end_s is not None and target_s >= self.end_s:
+            raise EOFError(
+                f"requested benchmark frame at {target_s:.3f}s beyond --input-video-end "
+                f"{self.end_s:.3f}s"
+            )
+
+        selected: av.VideoFrame | None = None
+        for decoded in self._decoder:
+            decoded_time = self._frame_time(decoded, self._stream)
+            if decoded_time + 1e-9 < target_s:
+                continue
+            selected = decoded
+            self._decoded_time = decoded_time
+            break
+        if selected is None:
+            raise EOFError(f"input video ended before benchmark time {target_s:.3f}s")
+
+        self._last_frame = self._convert(selected)
+        self._last_index = index
+        return self._last_frame
+
+    def close(self) -> None:
+        self._container.close()
+
+
 class H264Encoder:
     """Low-latency Annex-B encoder mirroring the browser's WebCodecs setup."""
 
@@ -263,12 +364,21 @@ class Config:
     measure_seconds: float
     prompt: str
     input_image: Path | None
+    input_video: Path | None
+    input_video_start: float
+    input_video_end: float | None
+    input_video_crop: tuple[int, int, int, int] | None
     output_json: Path | None
     capture_output_dir: Path | None
     jpeg_fallback: bool
     no_output_decode: bool
     num_inference_steps: int
-    max_temporal_ids: int
+    seed: int
+    max_temporal_ids: int | None
+    kv_reset_frames: int
+    freeze_kv_on_static: bool
+    static_diff_thresh: float
+    scene_cut_threshold: float
     max_pending: int
     jpeg_quality: int
     handshake_timeout: float
@@ -280,6 +390,7 @@ class Config:
     profile_timings: bool
     cache_last_denoise_kv: bool | None
     clean_kv_prefix_layers: int | None
+    exact_global_sink_kv: bool
 
 
 @dataclass
@@ -629,11 +740,20 @@ async def _sender(
     state: BenchmarkState,
     codec: str,
 ) -> None:
-    source = (
-        MovingImageFrames(config.input_image, config.width, config.height)
-        if config.input_image is not None
-        else SyntheticFrames(config.width, config.height)
-    )
+    if config.input_video is not None:
+        source = VideoFrames(
+            config.input_video,
+            config.width,
+            config.height,
+            config.fps,
+            start_s=config.input_video_start,
+            end_s=config.input_video_end,
+            crop=config.input_video_crop,
+        )
+    elif config.input_image is not None:
+        source = MovingImageFrames(config.input_image, config.width, config.height)
+    else:
+        source = SyntheticFrames(config.width, config.height)
     encoder = H264Encoder(config.width, config.height, config.fps) if codec == "h264" else None
     interval = 1.0 / config.fps
     run_start = time.monotonic()
@@ -728,6 +848,9 @@ async def _sender(
     finally:
         if encoder is not None:
             encoder.close()
+        close_source = getattr(source, "close", None)
+        if close_source is not None:
+            close_source()
 
 
 def _server_queues_idle(sample: dict[str, Any] | None) -> bool:
@@ -924,11 +1047,24 @@ def build_summary(config: Config, state: BenchmarkState, started_at: str) -> dic
             "warmup_seconds": config.warmup_seconds,
             "measure_seconds": config.measure_seconds,
             "prompt": config.prompt,
-            "input_source": str(config.input_image) if config.input_image is not None else "synthetic",
+            "input_source": (
+                str(config.input_video)
+                if config.input_video is not None
+                else (str(config.input_image) if config.input_image is not None else "synthetic")
+            ),
+            "input_video_start": config.input_video_start if config.input_video is not None else None,
+            "input_video_end": config.input_video_end,
+            "input_video_crop": list(config.input_video_crop) if config.input_video_crop else None,
             "cache_last_denoise_kv": config.cache_last_denoise_kv,
             "clean_kv_prefix_layers": config.clean_kv_prefix_layers,
+            "exact_global_sink_kv": config.exact_global_sink_kv,
             "num_inference_steps": config.num_inference_steps,
+            "seed": config.seed,
             "max_temporal_ids": config.max_temporal_ids,
+            "kv_reset_frames": config.kv_reset_frames,
+            "freeze_kv_on_static": config.freeze_kv_on_static,
+            "static_diff_thresh": config.static_diff_thresh,
+            "scene_cut_threshold": config.scene_cut_threshold,
             "max_pending": config.max_pending,
             "online_monitoring": config.online_monitoring,
             "profile_timings": config.profile_timings,
@@ -1054,14 +1190,17 @@ async def run_benchmark(config: Config) -> dict[str, Any]:
                 "height": config.height,
                 "num_inference_steps": config.num_inference_steps,
                 "max_temporal_ids": config.max_temporal_ids,
-                "seed": 42,
+                "seed": config.seed,
                 "use_pe": False,
                 "gate_enabled": False,
                 "no_person_blank": config.online_monitoring,
                 "require_face": config.online_monitoring,
                 "person_count_reedit": config.online_monitoring,
-                "kv_reset_frames": 0,
-                "freeze_kv_on_static": False,
+                "kv_reset_frames": config.kv_reset_frames,
+                "freeze_kv_on_static": config.freeze_kv_on_static,
+                "static_diff_thresh": config.static_diff_thresh,
+                "scene_cut_threshold": config.scene_cut_threshold,
+                "exact_global_sink_kv": config.exact_global_sink_kv,
                 "profile_timings": config.profile_timings,
                 "uplink_codec": requested_codec,
                 "downlink_codec": requested_codec,
@@ -1173,6 +1312,11 @@ async def run_benchmark(config: Config) -> dict[str, Any]:
                 {
                     "ordinal": ordinal,
                     "source_seq": source_seq,
+                    "source_index": (
+                        state.sent.get(source_seq, {}).get("source_index")
+                        if source_seq is not None
+                        else None
+                    ),
                     "codec": codec,
                     "bytes": len(payload),
                     "file": filename,
@@ -1200,10 +1344,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-seconds", type=_nonnegative_float, default=10.0)
     parser.add_argument("--measure-seconds", type=_positive_float, default=60.0)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
         "--input-image",
         type=Path,
         help="Use a deterministic slow pan over this image instead of the synthetic pattern",
+    )
+    input_group.add_argument(
+        "--input-video",
+        type=Path,
+        help="Sample a real motion clip sequentially instead of the synthetic pattern",
+    )
+    parser.add_argument("--input-video-start", type=_nonnegative_float, default=0.0)
+    parser.add_argument("--input-video-end", type=_positive_float)
+    parser.add_argument(
+        "--input-video-crop",
+        type=_crop_rect,
+        metavar="LEFT,TOP,RIGHT,BOTTOM",
+        help="Crop decoded video frames before resizing to the model resolution",
     )
     parser.add_argument("--output-json", type=Path, help="Also write the JSON summary to this path")
     parser.add_argument(
@@ -1222,7 +1380,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Measure output packets without decoding them for codec/resolution validation",
     )
     parser.add_argument("--num-inference-steps", type=_positive_int, default=2)
-    parser.add_argument("--max-temporal-ids", type=_positive_int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--max-temporal-ids",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Use rolling absolute temporal IDs capped at this value. The default "
+            "keeps the model's trained window-relative IDs (0,1,2 with the "
+            "three-chunk sink/window policy)."
+        ),
+    )
+    parser.add_argument("--kv-reset-frames", type=_nonnegative_int, default=0)
+    parser.add_argument(
+        "--freeze-kv-on-static",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Exercise experimental stale-tail anchor reuse (off for the quality baseline)",
+    )
+    parser.add_argument("--static-diff-thresh", type=_nonnegative_float, default=0.5)
+    parser.add_argument(
+        "--scene-cut-threshold",
+        type=_nonnegative_float,
+        default=25.0,
+        help="Reset causal state on an extreme full-frame luma discontinuity; 0 disables.",
+    )
     parser.add_argument("--max-pending", type=_positive_int, default=32)
     parser.add_argument("--jpeg-quality", type=_positive_int, default=85)
     parser.add_argument("--handshake-timeout", type=_positive_float, default=900.0)
@@ -1237,8 +1419,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile-timings",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Collect server CUDA-event stage timings (disable for an uninstrumented throughput run)",
+        default=False,
+        help="Collect intrusive server GPU-event stage timings (off for continuity/throughput runs)",
     )
     cache_group = parser.add_mutually_exclusive_group()
     cache_group.add_argument(
@@ -1260,6 +1442,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="With fast caching, overwrite this many leading layers from the exact clean latent",
     )
     parser.add_argument(
+        "--exact-global-sink-kv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store the permanent global-sink chunk exactly once (disable only for quality A/B)",
+    )
+    parser.add_argument(
         "--insecure",
         action="store_true",
         help="Disable TLS certificate verification for wss:// and /debug (test systems only)",
@@ -1277,6 +1465,20 @@ def _config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser)
         parser.error("H.264 mode requires even --width and --height")
     if args.input_image is not None and not args.input_image.is_file():
         parser.error(f"--input-image does not exist or is not a file: {args.input_image}")
+    if args.input_video is not None and not args.input_video.is_file():
+        parser.error(f"--input-video does not exist or is not a file: {args.input_video}")
+    if args.input_video is None and (args.input_video_end is not None or args.input_video_crop is not None):
+        parser.error("--input-video-end/--input-video-crop require --input-video")
+    if args.input_video_end is not None and args.input_video_end <= args.input_video_start:
+        parser.error("--input-video-end must be greater than --input-video-start")
+    source_duration = args.warmup_seconds + args.measure_seconds
+    if (
+        args.input_video_end is not None
+        and source_duration > args.input_video_end - args.input_video_start + 1e-9
+    ):
+        parser.error(
+            "warmup + measurement duration exceeds the selected input-video interval"
+        )
     return Config(
         url=args.url,
         width=args.width,
@@ -1286,12 +1488,21 @@ def _config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser)
         measure_seconds=args.measure_seconds,
         prompt=args.prompt,
         input_image=args.input_image,
+        input_video=args.input_video,
+        input_video_start=args.input_video_start,
+        input_video_end=args.input_video_end,
+        input_video_crop=args.input_video_crop,
         output_json=args.output_json,
         capture_output_dir=args.capture_output_dir,
         jpeg_fallback=args.jpeg_fallback,
         no_output_decode=args.no_output_decode,
         num_inference_steps=args.num_inference_steps,
+        seed=args.seed,
         max_temporal_ids=args.max_temporal_ids,
+        kv_reset_frames=args.kv_reset_frames,
+        freeze_kv_on_static=args.freeze_kv_on_static,
+        static_diff_thresh=args.static_diff_thresh,
+        scene_cut_threshold=args.scene_cut_threshold,
         max_pending=args.max_pending,
         jpeg_quality=args.jpeg_quality,
         handshake_timeout=args.handshake_timeout,
@@ -1303,6 +1514,7 @@ def _config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser)
         profile_timings=args.profile_timings,
         cache_last_denoise_kv=args.cache_last_denoise_kv,
         clean_kv_prefix_layers=args.clean_kv_prefix_layers,
+        exact_global_sink_kv=args.exact_global_sink_kv,
     )
 
 

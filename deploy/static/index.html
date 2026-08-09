@@ -278,8 +278,8 @@
     <div><input id="targetQueueDelayMs" type="number" value="1000" min="0" max="5000" step="50" /></div>
     <div><input id="maxQueueDelayMs" type="number" value="1500" min="0" max="8000" step="50" /></div>
   </div>
-  <input id="kvResetFrames" type="number" value="1080" min="0" step="1" />
-  <label><input id="useMaxTemporalIds" type="checkbox" checked /> <span data-i18n="max_temporal">最大时序 ID</span></label>
+  <input id="kvResetFrames" type="number" value="0" min="0" step="1" />
+  <label><input id="useMaxTemporalIds" type="checkbox" /> <span data-i18n="max_temporal">最大时序 ID</span></label>
   <div id="maxTemporalIdsWrap"><input id="maxTemporalIds" type="number" value="8" min="1" step="1" /></div>
   <label><input id="freezeKvOnStatic" type="checkbox" /> <span data-i18n="freeze_kv">静止时冻结 KV</span></label>
   <input id="staticDiffThresh" type="number" value="2.0" min="0" step="0.5" />
@@ -1759,12 +1759,18 @@ async function start() {
         return;
       }
       if (msg.type === "session_reset") {
-        clearOutputQueue();
-        pendingOutputMeta = null;
-        serverChunkLastSec = null;
-        chunkProfileLast = null;
-        lastWsSendMs = null;
-        lastServerResidenceMs = null;
+        // Keep the one-second jitter buffer across an automatic scene-cut
+        // reset. It masks the bounded causal-state rebuild and avoids a blank
+        // output pane while the new one-frame sink is generated. Semantic
+        // resets still discard frames from the previous edit state.
+        if (msg.reason !== "scene_cut") {
+          clearOutputQueue();
+          pendingOutputMeta = null;
+          serverChunkLastSec = null;
+          chunkProfileLast = null;
+          lastWsSendMs = null;
+          lastServerResidenceMs = null;
+        }
         const resetMsg = {
           person_count_changed: t("reset_count_changed"),
           person_returned:      t("reset_person_returned"),
@@ -2682,6 +2688,8 @@ function applyServerDefaults() {
   if (maxIds !== null && maxIds !== undefined) {
     document.getElementById("useMaxTemporalIds").checked = true;
     document.getElementById("maxTemporalIds").value = maxIds;
+  } else {
+    document.getElementById("useMaxTemporalIds").checked = false;
   }
   if (typeof syncUpQualityUi === "function") syncUpQualityUi();
 }
