@@ -775,11 +775,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     runtime.warmup_full_pipeline,
                     height=args.height,
                     width=args.width,
+                    num_chunks=(
+                        3 if getattr(runtime, "_dit_core_compiled", False) else 8
+                    ),
                     prompt=args.prompt,
                     num_inference_steps=args.num_inference_steps,
                     max_temporal_ids=args.max_temporal_ids,
                     freeze_kv_on_static=args.freeze_kv_on_static,
                     static_diff_thresh=args.static_diff_thresh,
+                    serial_chunks=getattr(runtime, "_dit_core_compiled", False),
                 )
                 await asyncio.get_running_loop().run_in_executor(
                     _app.state.frame_executor,

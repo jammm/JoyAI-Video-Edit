@@ -71,8 +71,8 @@ JOYOMNI_OPS_ROCM_ARCHS=gfx950 python -m pip install --no-build-isolation ./joyom
 
 On ROCm the native extension builds wave64-aware RMSNorm, adaLN modulation,
 Q/K norm + RoPE, and per-token OCP E4M3 quantization kernels. The runtime uses
-the native quantizer for the three `K=4096` image-stream projections and the
-faster TorchInductor/Triton implementation for the `K=16384` projection.
+the native quantizer for `K=4096` image- and text-stream projections and the
+faster TorchInductor/Triton implementation for `K=16384` projections.
 `torch._scaled_mm(..., use_fast_accum=True)` uses the gfx950
 hipBLASLt/Composable Kernel path. NVIDIA flash-attn is optional; PyTorch SDPA
 selects the available ROCm AOTriton/CK backend.
@@ -121,9 +121,12 @@ should both be true on gfx950 when the native quantizer and
 With `ROCR_VISIBLE_DEVICES` set, the launcher selects the qualified MI350X
 preset: pseudo-context causal VAE, event-ordered stage streams on one physical
 GPU, final-denoise K/V reuse, a one-time exact all-40-layer refresh for the
-permanent global sink, and a 24-layer clean refresh for later bounded tail
-chunks. It accepted 1,440 frames at 24.0 FPS and returned every complete
-temporal chunk at 23.883 source-window FPS over 60 seconds. Periodic K/V reset,
+permanent global sink, a 24-layer clean refresh for later bounded tail chunks,
+and one dynamic full graph around the 40-block DiT core. It accepted 1,440
+frames at 24.0 FPS and returned every complete temporal chunk at 23.883
+source-window FPS over 60 seconds. With FP8 image and text projections, the
+same hybrid policy also sustained 30.983 source-window FPS during a 60-second
+31 FPS backend-headroom run, with no drops or queue growth. Periodic K/V reset,
 temporal-ID capping, and experimental motion-based K/V freezing default off.
 Extreme full-frame discontinuities trigger a safe drain/reset so a hard cut is
 not blended with the prior scene. Set
@@ -131,10 +134,19 @@ not blended with the prior scene. Set
 policy on every chunk. `JOYOMNI_CLEAN_KV_PREFIX_LAYERS=0` selects the fastest,
 gentler editing policy for tail chunks.
 
-`JOYOMNI_STATEFUL_VAE=0`, `JOYOMNI_EXPLICIT_STREAMS=1`, and
-`JOYOMNI_CLEAN_KV_PREFIX_LAYERS=24` are the qualified gfx950 defaults. All
-streams still target the one logical `cuda:0`; this is neither multi-GPU
-execution nor CPU model offload.
+`JOYOMNI_FP8_IMG=1`, `JOYOMNI_FP8_TXT=1`, `JOYOMNI_STATEFUL_VAE=0`,
+`JOYOMNI_EXPLICIT_STREAMS=1`, and `JOYOMNI_CLEAN_KV_PREFIX_LAYERS=24` are the
+qualified gfx950 defaults. All streams still target the one logical `cuda:0`;
+this is neither multi-GPU execution nor CPU model offload.
+
+The ROCm launcher also defaults to
+`JOYOMNI_DIT_COMPILE_MODE=default`,
+`JOYOMNI_DIT_COMPILE_FULLGRAPH=1`, and
+`JOYOMNI_DIT_COMPILE_DYNAMIC=1`. The cache dictionaries stay eager while the
+complete tensor core is captured as one graph. First startup can take several
+minutes; keep `deploy/deps/cache/` and judge only warmed performance. Set the
+mode to an empty string for an eager A/B run. Max-autotune and static graph
+replay were measured and rejected because both were slower on gfx950.
 
 The launcher does not contain private paths or API credentials. Activate your environment before launching, or pass the conda entrypoint through environment variables:
 
@@ -188,14 +200,18 @@ The ROCm port was additionally qualified on one AMD Instinct MI350X
 | ROCm SDK | TheRock `10.1.0a20260807` |
 | Python / PyTorch | `3.12.3` / `2.13.0+rocm10.1.0a20260807` |
 | Triton / rocprofv3 | `3.8.0` / `1.3.5` |
-| Precision paths | BF16 activations, OCP E4M3 image projections, hipBLASLt/CK scaled GEMM, AOTriton/CK SDPA |
-| Live result | 1248x720 H.264, two denoising steps, exact 40-layer permanent sink + 24-layer tail refresh, 24.0 input / 23.883 source-window output FPS over 60 seconds |
+| Precision paths | BF16 activations, OCP E4M3 image/text projections, hipBLASLt/CK scaled GEMM, AOTriton/CK SDPA |
+| Live result | 1248x720 H.264, two denoising steps, dynamic full-graph DiT, exact 40-layer permanent sink + 24-layer tail refresh, 31.0 input / 30.983 source-window / 30.933 receive-window output FPS over 60 seconds |
 
 For the qualified MI350X live preset, launch with `--num-inference-steps 2`;
 the launcher supplies the one-time exact global sink plus hybrid 24-layer tail
-refresh by default on ROCm. The one-step preset measured 24.067 FPS, while the
-slower policy that refreshes all 40 layers on every chunk measured about 18.7
-FPS at this resolution. Full
+refresh by default on ROCm. After the cache-boundary and full-graph work, even
+the stricter policy that refreshes all 40 layers on every chunk sustained the
+24 FPS gate for 60 seconds: mean/p95/max service time was
+289.1/295.4/301.4 ms per eight-frame chunk. The older 18.7 FPS measurement
+predates that optimization. The browser remains capped at the upstream 24 FPS
+despite the measured greater-than-30-FPS backend capacity, preserving
+continuity headroom. Full
 reproduction commands and profiling results are in [`HANDOFF.md`](HANDOFF.md).
 
 ## 2. Clone JoyAI-Video-Edit Weights
@@ -306,4 +322,7 @@ Check server health after launch:
 curl http://127.0.0.1:8080/health
 ```
 
-The first launch can be slow because PyTorch, Triton, CUDA kernels, VAE paths, and DiT attention kernels need to compile and warm up. Keep `deploy/deps/cache/` stable across restarts to reuse compile artifacts.
+The first launch can take several minutes because PyTorch, Triton, accelerator
+kernels, VAE paths, and all dynamic DiT cache states compile and warm up. This
+is intentional: warmed throughput is the deployment objective. Keep
+`deploy/deps/cache/` stable across restarts to reuse compile artifacts.

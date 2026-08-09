@@ -40,7 +40,11 @@ fi
 DEVICE="${JOYOMNI_DEVICE:-cuda:0}"
 
 export JOYOMNI_FP8_IMG="${JOYOMNI_FP8_IMG:-1}"
-export JOYOMNI_FP8_TXT="${JOYOMNI_FP8_TXT:-0}"
+if [ -n "${ROCR_VISIBLE_DEVICES:-}" ]; then
+  export JOYOMNI_FP8_TXT="${JOYOMNI_FP8_TXT:-1}"
+else
+  export JOYOMNI_FP8_TXT="${JOYOMNI_FP8_TXT:-0}"
+fi
 export JOYOMNI_TUNABLEOP_FILE="${JOYOMNI_TUNABLEOP_FILE:-$HERE/deps/cache/tunableop_results_gfx950.csv}"
 
 # Qualified MI350X/gfx950 streaming preset.  Direct Python callers retain the
@@ -51,6 +55,15 @@ if [ -n "${ROCR_VISIBLE_DEVICES:-}" ]; then
   export JOYOMNI_EXPLICIT_STREAMS="${JOYOMNI_EXPLICIT_STREAMS:-1}"
   export JOYOMNI_CACHE_LAST_DENOISE_KV="${JOYOMNI_CACHE_LAST_DENOISE_KV:-1}"
   export JOYOMNI_CLEAN_KV_PREFIX_LAYERS="${JOYOMNI_CLEAN_KV_PREFIX_LAYERS:-24}"
+  # The mutable cache dictionaries stay eager while the complete 40-block
+  # tensor core is captured as one dynamic Inductor graph. Compilation is
+  # intentionally expensive; warmed throughput is the deployment objective.
+  export JOYOMNI_DIT_COMPILE_MODE="${JOYOMNI_DIT_COMPILE_MODE:-default}"
+  export JOYOMNI_DIT_COMPILE_FULLGRAPH="${JOYOMNI_DIT_COMPILE_FULLGRAPH:-1}"
+  export JOYOMNI_DIT_COMPILE_DYNAMIC="${JOYOMNI_DIT_COMPILE_DYNAMIC:-1}"
+  export JOYOMNI_DIT_RECOMPILE_LIMIT="${JOYOMNI_DIT_RECOMPILE_LIMIT:-32}"
+  export JOYOMNI_DIT_ACCUMULATED_RECOMPILE_LIMIT="${JOYOMNI_DIT_ACCUMULATED_RECOMPILE_LIMIT:-256}"
+  export JOYOMNI_DIT_COMPILE_WARMUP_CHUNKS="${JOYOMNI_DIT_COMPILE_WARMUP_CHUNKS:-3}"
 fi
 
 # ---- recording ----

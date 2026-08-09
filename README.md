@@ -104,9 +104,12 @@ ROCm PyTorch environment, install `requirements-rocm.txt`, and build the gfx950
 kernels as described in [`DEPLOYMENT.md`](DEPLOYMENT.md#amd-rocm--gfx950).
 The tested MI350X live preset uses two denoising steps at 1248x720 and a
 hybrid clean-KV policy: all 40 layers for the permanent global sink once and
-24 layers for later bounded tail chunks. A safe drain/reset keeps real scene
-cuts from being blended with prior causal state. The one-GPU preset accepts a
-steady 24 FPS while preserving every complete temporal chunk; see
+24 layers for later bounded tail chunks. Its dynamic full-graph DiT compile can
+take several minutes at startup, then runs entirely on the selected logical
+`cuda:0`; no model role is offloaded to CPU or another GPU. A safe drain/reset
+keeps real scene cuts from being blended with prior causal state. The one-GPU
+backend sustained more than 30 FPS while preserving every complete temporal
+chunk; the browser retains the upstream 24 FPS cap for operating headroom. See
 [`HANDOFF.md`](HANDOFF.md) for the exact TheRock setup, launch, benchmark, and
 rocprof commands.
 

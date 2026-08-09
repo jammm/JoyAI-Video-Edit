@@ -355,6 +355,80 @@ class JoyOmniRuntime:
         except Exception as _wexc:
             print(f"#####[STREAM] full-pipeline warmup error (non-fatal): {_wexc!r}")
 
+        # Compile only after eager warmup: by this point the lazy FP8
+        # projections already exist. Mutable Python KV dictionaries remain
+        # outside this compiled 40-block tensor boundary.
+        _dit_compile_mode = os.environ.get("JOYOMNI_DIT_COMPILE_MODE", "").strip()
+        if _dit_compile_mode:
+            try:
+                _dit_compile_fullgraph = _env_enabled(
+                    "JOYOMNI_DIT_COMPILE_FULLGRAPH", default=False
+                )
+                _dit_compile_dynamic = _env_enabled(
+                    "JOYOMNI_DIT_COMPILE_DYNAMIC", default=False
+                )
+                _dit_recompile_limit = int(
+                    os.environ.get("JOYOMNI_DIT_RECOMPILE_LIMIT", "64")
+                )
+                _dit_accumulated_recompile_limit = int(
+                    os.environ.get(
+                        "JOYOMNI_DIT_ACCUMULATED_RECOMPILE_LIMIT",
+                        str(max(256, _dit_recompile_limit * 16)),
+                    )
+                )
+                # Set both the current and legacy spellings and pass the
+                # per-compile value explicitly; older compile contexts can
+                # otherwise retain PyTorch's default of 8.
+                torch._dynamo.config.recompile_limit = _dit_recompile_limit
+                torch._dynamo.config.cache_size_limit = _dit_recompile_limit
+                torch._dynamo.config.accumulated_recompile_limit = (
+                    _dit_accumulated_recompile_limit
+                )
+                torch._dynamo.config.accumulated_cache_size_limit = (
+                    _dit_accumulated_recompile_limit
+                )
+                print(
+                    "#####[STREAM] compiling DiT block core "
+                    f"mode={_dit_compile_mode!r} fullgraph={_dit_compile_fullgraph} "
+                    f"dynamic={_dit_compile_dynamic} "
+                    f"recompile_limit={torch._dynamo.config.recompile_limit} "
+                    "accumulated_recompile_limit="
+                    f"{torch._dynamo.config.accumulated_recompile_limit}",
+                    flush=True,
+                )
+                pipeline.transformer._compiled_double_blocks = torch.compile(
+                    pipeline.transformer._run_double_blocks,
+                    mode=_dit_compile_mode,
+                    fullgraph=_dit_compile_fullgraph,
+                    dynamic=_dit_compile_dynamic,
+                    recompile_limit=_dit_recompile_limit,
+                    isolate_recompiles=True,
+                )
+                _dit_compile_warmup_chunks = int(
+                    os.environ.get("JOYOMNI_DIT_COMPILE_WARMUP_CHUNKS", "3")
+                )
+                for (_wh, _ww) in _orientations:
+                    # Inductor autotuning runs kernels on the live device.
+                    # Feed one chunk at a time so another stage cannot launch
+                    # VAE work concurrently and corrupt a tuning measurement.
+                    runtime.warmup_full_pipeline(
+                        height=_wh,
+                        width=_ww,
+                        num_chunks=_dit_compile_warmup_chunks,
+                        serial_chunks=True,
+                        raise_on_error=True,
+                    )
+                runtime._dit_core_compiled = True
+                print("#####[STREAM] compiled DiT block-core warmup complete", flush=True)
+            except Exception as _dit_compile_exc:
+                print(
+                    "#####[STREAM] DiT block-core compile failed; restoring eager core: "
+                    f"{_dit_compile_exc!r}",
+                    flush=True,
+                )
+                pipeline.transformer._compiled_double_blocks = None
+                runtime._dit_core_compiled = False
+
         return runtime
 
     def create_v2v_session(
@@ -382,6 +456,8 @@ class JoyOmniRuntime:
         max_temporal_ids: int | None = None,
         freeze_kv_on_static: bool = False,
         static_diff_thresh: float = 2.0,
+        serial_chunks: bool = False,
+        raise_on_error: bool = False,
     ) -> None:
         t0 = time.time()
 
@@ -404,13 +480,44 @@ class JoyOmniRuntime:
             )
             rng = np.random.default_rng(0)
             completed = 0
-            for i in range(n_frames):
-                arr = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
-                frame = Image.fromarray(arr, mode="RGB")
-                results = session.push_frame(frame, frame_meta={"seq": i + 1, "t_capture_ms": 0.0})
-                completed += len(results)
-                if completed >= num_chunks:
-                    break
+            submitted = 0
+            if serial_chunks:
+                # The causal stream emits its first latent chunk from one
+                # source frame and each subsequent chunk from ffactor_t more.
+                # Waiting after every group prevents cross-stage work from
+                # overlapping compiler/autotuner GPU probes.
+                for chunk_idx in range(num_chunks):
+                    frames_this_chunk = 1 if chunk_idx == 0 else ffactor_t
+                    for _ in range(frames_this_chunk):
+                        arr = rng.integers(
+                            0, 256, size=(height, width, 3), dtype=np.uint8
+                        )
+                        frame = Image.fromarray(arr, mode="RGB")
+                        submitted += 1
+                        results = session.push_frame(
+                            frame,
+                            frame_meta={"seq": submitted, "t_capture_ms": 0.0},
+                        )
+                        completed += len(results)
+                    while completed <= chunk_idx:
+                        result = session.wait_async_result(timeout=600.0)
+                        if result is None:
+                            raise TimeoutError(
+                                f"serial warmup timed out after chunk {chunk_idx}"
+                            )
+                        completed += 1
+            else:
+                for i in range(n_frames):
+                    arr = rng.integers(
+                        0, 256, size=(height, width, 3), dtype=np.uint8
+                    )
+                    frame = Image.fromarray(arr, mode="RGB")
+                    results = session.push_frame(
+                        frame, frame_meta={"seq": i + 1, "t_capture_ms": 0.0}
+                    )
+                    completed += len(results)
+                    if completed >= num_chunks:
+                        break
 
             deadline = time.time() + 120.0
             while completed < num_chunks and time.time() < deadline:
@@ -420,6 +527,8 @@ class JoyOmniRuntime:
             print(f"#####[STREAM] full-pipeline warmup done: {completed} chunks in {time.time() - t0:.1f}s")
         except Exception as exc:
             print(f"#####[STREAM] full-pipeline warmup skipped/failed: {exc!r}")
+            if raise_on_error:
+                raise
         finally:
             if session is not None:
                 try:

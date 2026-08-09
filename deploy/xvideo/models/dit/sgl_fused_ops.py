@@ -55,7 +55,11 @@ def fused_layernorm_modulate(
     B, L, D = x.shape
 
     if _try_import():
-        x_2d = x.reshape(-1, D)
+        # Inductor may feed this custom-op boundary a valid strided layout,
+        # while the native ROCm kernel vectorizes the feature dimension and
+        # requires stride(-1) == 1.  This is free for the eager contiguous
+        # layout and materializes only when the compiled producer needs it.
+        x_2d = x.contiguous().reshape(-1, D)
         # adaLN produces one modulation vector per batch item. Online
         # streaming is B=1, so let the native kernel broadcast [1, D] over
         # all token rows instead of materializing two [L, D] copies per norm.

@@ -372,7 +372,10 @@ class MMDoubleStreamBlock(nn.Module):
         cached_freqs_cis: Optional[tuple] = None,
         kv_cache_write_seq_len: Optional[int] = None,
         kv_cache_write_only: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cached_key: Optional[torch.Tensor] = None,
+        cached_value: Optional[torch.Tensor] = None,
+        return_kv_cache: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         _maybe_install_fp8_stream(self, "img")
         _fp8_on = _fp8_stream_enabled(self, "img")
         if not skip_text_stream:
@@ -407,7 +410,7 @@ class MMDoubleStreamBlock(nn.Module):
             img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
         )
         img_k_for_cache = None
-        if kv_cache_pre_rope and kv_cache_writer is not None:
+        if kv_cache_pre_rope and (kv_cache_writer is not None or return_kv_cache):
             img_q, img_k, img_k_for_cache = _sgl_fused.fused_qk_norm_rope_3d(
                 img_q, img_k,
                 q_norm_weight=self.img_attn_q_norm.weight,
@@ -439,19 +442,26 @@ class MMDoubleStreamBlock(nn.Module):
                 txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
             )
 
-        if kv_cache_writer is not None:
+        cache_key = cache_value = None
+        if kv_cache_writer is not None or return_kv_cache:
             cache_key = img_k_for_cache
             cache_value = img_v
             if kv_cache_write_seq_len is not None:
                 cache_key = cache_key[:, :kv_cache_write_seq_len]
                 cache_value = cache_value[:, :kv_cache_write_seq_len]
-            kv_cache_writer(layer_idx, cache_key, cache_value)
+            if kv_cache_writer is not None:
+                kv_cache_writer(layer_idx, cache_key, cache_value)
             if kv_cache_write_only:
                 # Cache-only forwards do not consume this block's output once
                 # the final requested layer has written its K/V tensors.
+                if return_kv_cache:
+                    return img, txt, cache_key, cache_value
                 return img, txt
 
-        if kv_cache_assembler is not None:
+        if cached_key is not None or cached_value is not None:
+            if cached_key is None or cached_value is None:
+                raise ValueError("cached_key and cached_value must be provided together")
+        elif kv_cache_assembler is not None:
             cached_key, cached_value = kv_cache_assembler(
                 layer_idx,
                 device=img_q.device,
@@ -543,6 +553,8 @@ class MMDoubleStreamBlock(nn.Module):
                 txt_mod2_gate,
             )
 
+        if return_kv_cache:
+            return img, txt, cache_key, cache_value
         return img, txt
 
 
@@ -803,6 +815,55 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self._kv_assembly_cache[layer_idx] = (cached_key, cached_value)
         return cached_key, cached_value
 
+    @torch.compiler.disable
+    def _prepare_layer_kv_cache_inputs(
+        self,
+        layer_count: int,
+        *,
+        reuse_cache: bool,
+        use_memo: bool,
+        device: torch.device,
+        dtype: torch.dtype,
+        cached_freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]], ...]:
+        """Resolve mutable Python cache state before the tensor-heavy block graph.
+
+        Dynamo cannot safely capture the nested cache dictionaries.  Preparing
+        all layer inputs at one explicit graph boundary keeps the full 40-block
+        tensor loop compilable instead of recompiling a resumed block frame for
+        every layer and cache mode.
+        """
+        if not reuse_cache:
+            return tuple((None, None) for _ in range(layer_count))
+
+        resolved = []
+        for layer_idx in range(layer_count):
+            if use_memo:
+                cached_key, cached_value = self._assemble_layer_kv_cache_cached(
+                    layer_idx,
+                    device=device,
+                    dtype=dtype,
+                    cached_freqs_cis=cached_freqs_cis,
+                )
+            else:
+                cached_key, cached_value = _concat_kv_entries(
+                    self._read_layer_kv_cache(layer_idx),
+                    device=device,
+                    dtype=dtype,
+                    cached_freqs_cis=cached_freqs_cis,
+                )
+            resolved.append((cached_key, cached_value))
+        return tuple(resolved)
+
+    @torch.compiler.disable
+    def _commit_layer_kv_cache_outputs(
+        self,
+        outputs: Iterable[Tuple[int, torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Commit block-produced K/V tensors after leaving the compiled graph."""
+        for layer_idx, key, value in outputs:
+            self._write_layer_kv_cache(layer_idx, key, value)
+
     def _write_layer_kv_cache(
         self,
         layer_idx: Optional[int],
@@ -924,6 +985,60 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     f"`temporal_ids` must be 1D with length {num_frames}, got {tuple(frame_ids.shape)}."
                 )
         return frame_ids.repeat_interleave(spatial_tokens_per_frame)
+
+    def _run_double_blocks(
+        self,
+        img: torch.Tensor,
+        txt: torch.Tensor,
+        vec: torch.Tensor,
+        vis_freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+        layer_cached_kv: tuple[
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor]], ...
+        ],
+        *,
+        skip_text_stream: bool,
+        kv_cache_pre_rope: bool,
+        kv_cache_write_seq_len: Optional[int],
+        write_cache: bool,
+        cache_only_layers: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        tuple[Tuple[int, torch.Tensor, torch.Tensor], ...],
+    ]:
+        """Tensor-only 40-block core, isolated from mutable KV dictionaries.
+
+        This boundary is deliberately suitable for one whole ``torch.compile``
+        graph.  Cache lookup/commit stays in the eager wrapper, while K/V
+        tensors cross the boundary without copies.
+        """
+        active_layers = cache_only_layers or len(self.double_blocks)
+        pending_cache_outputs = []
+        for layer_idx in range(active_layers):
+            cache_write_only = (
+                cache_only_layers > 0 and layer_idx + 1 == active_layers
+            )
+            block_result = self.double_blocks[layer_idx](
+                img,
+                txt,
+                vec,
+                vis_freqs_cis,
+                skip_text_stream=skip_text_stream,
+                kv_cache_pre_rope=kv_cache_pre_rope,
+                kv_cache_write_seq_len=kv_cache_write_seq_len,
+                kv_cache_write_only=cache_write_only,
+                cached_key=layer_cached_kv[layer_idx][0],
+                cached_value=layer_cached_kv[layer_idx][1],
+                return_kv_cache=write_cache,
+            )
+            if write_cache:
+                img, txt, cache_key, cache_value = block_result
+                pending_cache_outputs.append(
+                    (layer_idx, cache_key, cache_value)
+                )
+            else:
+                img, txt = block_result
+        return img, txt, tuple(pending_cache_outputs)
 
     def forward(
         self,
@@ -1101,30 +1216,42 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 self._kv_assembly_freqs = cached_freqs_cis
                 self._kv_assembly_cache = {}
 
-        for layer_idx, block in enumerate(self.double_blocks):
-            cache_prefix_last_layer = (
-                kv_cache_store_prefix_layers is not None
-                and layer_idx + 1 == kv_cache_store_prefix_layers
-            )
-            img, txt = block(
-                img,
-                txt,
-                vec,
-                vis_freqs_cis,
-                layer_idx=layer_idx,
-                kv_cache_reader=self._read_layer_kv_cache if kv_cache_mode in {"reuse", "reuse_store"} else None,
-                kv_cache_writer=self._write_layer_kv_cache if kv_cache_mode in {"store", "reuse_store"} else None,
-                kv_cache_assembler=self._assemble_layer_kv_cache_cached if use_memo else None,
-                skip_text_stream=skip_text_stream,
-                kv_cache_pre_rope=kv_cache_pre_rope,
-                cached_freqs_cis=cached_freqs_cis,
-                kv_cache_write_seq_len=current_seq_len if kv_cache_store_current_only else None,
-                kv_cache_write_only=cache_prefix_last_layer,
-            )
-            if cache_prefix_last_layer:
-                # The caller requested cache material only. Avoid all remaining
-                # blocks plus the output projection/unpatchify path.
-                return (hidden_states, txt)
+        reuse_cache = kv_cache_mode in {"reuse", "reuse_store"}
+        write_cache = kv_cache_mode in {"store", "reuse_store"}
+        layer_cached_kv = self._prepare_layer_kv_cache_inputs(
+            len(self.double_blocks),
+            reuse_cache=reuse_cache,
+            use_memo=use_memo,
+            device=img.device,
+            dtype=img.dtype,
+            cached_freqs_cis=cached_freqs_cis if kv_cache_pre_rope else None,
+        )
+        cache_only_layers = int(kv_cache_store_prefix_layers or 0)
+        block_runner = getattr(self, "_compiled_double_blocks", None)
+        if block_runner is None:
+            block_runner = self._run_double_blocks
+        img, txt, pending_cache_outputs = block_runner(
+            img,
+            txt,
+            vec,
+            vis_freqs_cis,
+            layer_cached_kv,
+            skip_text_stream=skip_text_stream,
+            kv_cache_pre_rope=kv_cache_pre_rope,
+            kv_cache_write_seq_len=(
+                current_seq_len if kv_cache_store_current_only else None
+            ),
+            write_cache=write_cache,
+            cache_only_layers=cache_only_layers,
+        )
+
+        if pending_cache_outputs:
+            self._commit_layer_kv_cache_outputs(pending_cache_outputs)
+
+        if cache_only_layers:
+            # The caller requested cache material only. Avoid the output
+            # projection/unpatchify path after the final requested layer.
+            return (hidden_states, txt)
 
         img = self.proj_out(self.norm_out(img))
 

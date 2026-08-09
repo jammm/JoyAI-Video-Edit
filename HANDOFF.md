@@ -1,6 +1,6 @@
 # JoyAI Video Edit ROCm/gfx950 handoff
 
-Prepared 2026-08-08 from upstream commit
+Prepared 2026-08-08 and updated 2026-08-09 from upstream commit
 `231aab0d32f62fefc853cf9a046b8f29b4a39dfd`.
 
 This branch contains the ROCm/gfx950 port, native wave64
@@ -46,10 +46,14 @@ Completed and validated on an MI350X (`gfx950`):
   SDPA, OCP FP8 scaled GEMM, and `rocprofv3` smoke tests.
 - A ROCm-safe `joyomni_ops` build path with wave64-aware native RMSNorm,
   layernorm/modulation, and paired Q/K norm + 3D RoPE kernels.
-- A gfx950 FP8 path using a native wave64 row-wise E4M3FN quantizer for the
-  three `K=4096` projections, compiled Triton quantization for the `K=16384`
-  projection, and `torch._scaled_mm`; NVIDIA CUTLASS/flash-attn are optional
-  and not imported on ROCm.
+- A gfx950 FP8 path for both DiT image and text projection streams, using a
+  native wave64 row-wise E4M3FN quantizer for `K=4096`, compiled Triton
+  quantization for `K=16384`, and `torch._scaled_mm`; NVIDIA
+  CUTLASS/flash-attn are optional and not imported on ROCm.
+- A dynamic, full-graph `torch.compile` boundary around the complete 40-block
+  DiT tensor core. Mutable K/V dictionaries are resolved and committed outside
+  the graph, and native custom ops provide FakeTensor registrations so Dynamo
+  does not fragment the model at every fused kernel.
 - GPU-only fallbacks; no model CPU offload was added.
 - Correct 720x1248 VAE warmup geometry and removal of redundant streaming VAE
   work, scheduler/device synchronization, repeated RGB/JPEG conversions, and
@@ -81,18 +85,33 @@ work to the CPU.
 
 The final qualified live preset uses two denoising steps, exact all-layer clean
 K/V for the one permanent sink, a 24-layer clean refresh for later chunks,
-window-relative temporal IDs, `--kv-reset-frames 0`,
-`--no-freeze-kv-on-static`, `--scene-cut-threshold 25`, `--no-use-pe`,
-`--no-online-gate`, and no session recording. Its 60-second 1248x720 H.264 run
-accepted and acknowledged all 1,440 inputs at 24.0 FPS with zero
-protocol/decode errors, zero backpressure skips, zero scheduled drops, and a
-maximum pending depth of four frames. It returned all 1,433 frames belonging
-to complete temporal chunks (23.883 source-window FPS; the final seven inputs
-remain an intentionally incomplete chunk). Mean/p95 server chunk residence was
-431.8/515.0 ms, mean/p95 end-to-end latency was 681.1/855.8 ms, and the largest
-packet gap was 435.4 ms, within the browser's adaptive one-second decoded-frame
-buffer. The slower policy that refreshes all 40 layers on every chunk produced
-about 18.7 FPS and therefore does not meet the 24 FPS live acceptance target.
+dynamic full-graph DiT compilation, window-relative temporal IDs,
+`--kv-reset-frames 0`, `--no-freeze-kv-on-static`,
+`--scene-cut-threshold 25`, `--no-use-pe`, `--no-online-gate`, and no session
+recording.
+
+The stricter all-40-layer clean-cache policy was used as the current
+steady-state performance gate. Its 60-second 1248x720 H.264 run accepted and
+acknowledged all 1,440 measured inputs at 24.0 FPS with zero protocol/decode
+errors, backpressure skips, or scheduled drops and no sustained queue growth.
+It returned all 1,433 outputs belonging to complete temporal chunks (23.883
+source-window FPS; the last seven inputs intentionally form an incomplete
+chunk). Mean/p50/p95/max server service time per eight-frame chunk was
+289.1/288.8/295.4/301.4 ms against a 333.3 ms budget. Mean/p95 end-to-end
+latency was 557.5/712.5 ms and the largest packet gap was 450.4 ms. The hybrid
+24-layer tail refresh remains the browser default and reduces its clean-cache
+forward from roughly 27 ms to 16 ms. The previously documented 18.7 FPS
+all-layer result predates the cache-boundary and whole-core compilation work
+and is no longer representative.
+
+The final FP8 image-and-text preset was also stress-qualified above the UI
+rate. A 60-second run accepted all 1,860 measured inputs at 31.0 FPS, produced
+30.983 source-window output FPS and 30.933 receive-window output FPS, and
+finished with every stage queue empty. It reported zero protocol/decode
+errors, backend skips, scheduled drops, or client decode drops. A 32 FPS run
+reached 31.2 receive-window FPS but accumulated work, so 31 FPS is the measured
+backend limit rather than a recommended browser capture rate. The upstream
+browser cap remains 24 FPS to retain operating headroom and continuity.
 
 ## 1. Create the ROCm environment
 
@@ -222,7 +241,13 @@ on the selected GPU. The first launch compiles/autotunes kernels; retain
 to the qualified pseudo-context VAE, event-ordered single-GPU stream,
 hybrid-KV preset (`JOYOMNI_STATEFUL_VAE=0`,
 `JOYOMNI_EXPLICIT_STREAMS=1`, `JOYOMNI_CACHE_LAST_DENOISE_KV=1`, and
-`JOYOMNI_CLEAN_KV_PREFIX_LAYERS=24`). Set
+`JOYOMNI_CLEAN_KV_PREFIX_LAYERS=24`), FP8 image and text projection streams
+(`JOYOMNI_FP8_IMG=1` and `JOYOMNI_FP8_TXT=1`), plus the dynamic full-graph DiT preset
+(`JOYOMNI_DIT_COMPILE_MODE=default`,
+`JOYOMNI_DIT_COMPILE_FULLGRAPH=1`, and
+`JOYOMNI_DIT_COMPILE_DYNAMIC=1`). Compilation can take several minutes; this
+is intentional because warmed throughput is the deployment objective. Set
+`JOYOMNI_DIT_COMPILE_MODE` to an empty string for an eager A/B run. Set
 `JOYOMNI_CACHE_LAST_DENOISE_KV=0` for the slower exact all-layer cache policy.
 
 Check health locally:
@@ -250,17 +275,19 @@ python deploy/benchmark_streaming.py \
   --no-freeze-kv-on-static --scene-cut-threshold 25 \
   --cache-last-denoise-kv --clean-kv-prefix-layers 24 \
   --no-profile-timings \
-  --warmup-seconds 0 --measure-seconds 60 \
+  --warmup-seconds 10 --measure-seconds 60 \
   --output-json "$ARTIFACT_ROOT/streaming.json"
 ```
 
-The UI is capped at 24 FPS. The live acceptance gate is sustained decoded
-output of at least 23.5 FPS for 60 seconds at 1248x720 and two denoising steps,
-with no protocol/decode errors or sustained queue/drop growth. The local
-validation artifact (intentionally excluded from Git) is
-`$ARTIFACT_ROOT/sdpa-scene-reset-prefix24-60s.json`: 24.0 input FPS and 23.883
-source-window output FPS, zero errors/drops/skips, and bounded queues over the
-60-second measurement.
+The UI is capped at 24 FPS. The user-facing acceptance gate is sustained
+decoded output of at least 23.5 FPS for 60 seconds at 1248x720 and two
+denoising steps, with no protocol/decode errors or sustained queue/drop
+growth. For backend-headroom qualification, rerun the same command with
+`--fps 31`; the qualified FP8 image-and-text preset sustained 30.983
+source-window FPS for 60 seconds, with zero errors/drops/skips and every stage
+queue empty at completion. A 32 FPS overload run grew queues and is not a
+sustainable target. A stricter all-layer run should also remain below the
+333.3 ms eight-frame service budget after warmup.
 Application stage timing is deliberately disabled for this acceptance run;
 `--profile-timings` inserts cross-thread GPU events and is intended only for a
 separate diagnostic run, not user-facing continuity or throughput numbers.
@@ -361,6 +388,26 @@ TLS reverse proxy in front of the loopback-bound service and use a
 client-resolvable DNS name. Neither a hostname nor a certificate is embedded in
 the repository.
 
+For Cloudflare Tunnel, route an HTTP origin rather than raw TCP:
+
+```bash
+cloudflared tunnel --no-autoupdate --url "http://${SERVICE_HOST}:${SERVICE_PORT}"
+```
+
+Raw `tcp://` routes require client-side `cloudflared access tcp` and cannot be
+opened directly by a browser. The host network must permit the Cloudflare
+Tunnel data plane to `region1.v2.argotunnel.com` and
+`region2.v2.argotunnel.com` on outbound UDP 7844 (QUIC) or TCP 7844 (HTTP/2).
+If only TCP is permitted, add `--protocol http2`. Quick Tunnel hostnames are
+random and process-lifetime-only; a durable hostname requires a named tunnel,
+a Cloudflare-managed domain, and a tunnel token.
+
+If API registration over HTTPS succeeds but tunnel readiness remains at zero,
+QUIC times out, and forced HTTP/2 receives TCP/TLS resets while the local
+outbound firewall is permissive, the blocker is upstream/datacenter egress
+filtering. Changing the JoyAI origin or its certificate cannot repair that;
+the network must allow one of the 7844 data-plane transports.
+
 For a controlled local-network demo, a self-signed proxy can be created without
 putting host-specific paths in the checkout. Keep `SERVICE_HOST=127.0.0.1`, set
 `PUBLIC_ORIGIN_HOST` to the address clients use, and set `TLS_SAN` to either an
@@ -403,6 +450,21 @@ Native and runtime validation record:
 - Native gfx950 FP8 quantization matched the reference at relative error below
   `9e-8`; the final extension parity suite passed all five native operations.
 - ROCm SDPA and OCP E4M3FN scaled GEMM produced finite bfloat16 output.
+- The full 40-block dynamic graph compiled without graph breaks; alternate
+  prompt lengths reused one graph. Default mode reduced the two-step DiT from
+  149.8 ms eager to 147.5 ms in the focused stage profile. Max-autotune and
+  static HIP-graph replay were both slower and were rejected.
+- Enabling FP8 on the text stream reduced the focused two-step DiT stage to
+  144.9 ms and mean total eight-frame service from about 279.0 ms to 267.0 ms.
+  The 60-second 31 FPS qualification sustained 30.983 source-window and 30.933
+  receive-window output FPS without queue growth or drops.
+- Repeated compiled output captures were bit-identical. Against eager output
+  from the same deterministic source/seed, decoded-frame cosine averaged
+  0.9828; two eager runs averaged 0.9907 because the asynchronous eager path is
+  itself not bit-deterministic.
+- Against the otherwise identical BF16-text capture, the FP8-text capture had
+  0.9844 mean decoded-frame cosine and was visually equivalent across sampled
+  frames. Its cosine against the eager reference was 0.9797.
 - Static Python compilation, focused CPU units, scheduler parity, PyAV H.264
   round trips, mocked WebSocket flow, bounded-queue behavior, and concurrent
   encoder lifecycle tests passed.
