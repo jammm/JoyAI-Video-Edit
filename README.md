@@ -109,7 +109,10 @@ take several minutes at startup, then runs entirely on the selected logical
 `cuda:0`; no model role is offloaded to CPU or another GPU. A safe drain/reset
 keeps real scene cuts from being blended with prior causal state. The one-GPU
 backend sustained more than 30 FPS while preserving every complete temporal
-chunk; the browser retains the upstream 24 FPS cap for operating headroom. See
+chunk; prompt changes retain that safe teardown while cancelling obsolete
+queued work and preserving buffered playback. Reference-image shapes are
+warmed at startup. The browser retains the upstream 24 FPS cap for operating
+headroom. See
 [`HANDOFF.md`](HANDOFF.md) for the exact TheRock setup, launch, benchmark, and
 rocprof commands.
 

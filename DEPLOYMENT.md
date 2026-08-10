@@ -323,6 +323,9 @@ curl http://127.0.0.1:8080/health
 ```
 
 The first launch can take several minutes because PyTorch, Triton, accelerator
-kernels, VAE paths, and all dynamic DiT cache states compile and warm up. This
-is intentional: warmed throughput is the deployment objective. Keep
-`deploy/deps/cache/` stable across restarts to reuse compile artifacts.
+kernels, VAE paths, and all dynamic DiT cache states compile and warm up. On
+ROCm, the launcher also warms all 49 reference-image buckets so an unseen
+reference shape cannot trigger a 25-29 second compile during a prompt switch.
+This is intentional: warmed throughput and predictable interaction are the
+deployment objectives. Wait for `/health`, and keep `deploy/deps/cache/` stable
+across restarts to reuse compile artifacts.

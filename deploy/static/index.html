@@ -324,6 +324,7 @@ const I18N = {
     busy_camera_err: "摄像头错误",
     busy_queue: "排队 #",
     busy_resetting: "正在重置会话",
+    busy_switching: "正在切换提示词",
     hint_no_face: "请正对摄像头，露出完整的脸 😊",
     hint_no_person: "未检测到人，请回到画面中 😊",
     gate_too_close: "请让上半身入镜（坐正 / 把脸移到画面上半部）",
@@ -384,6 +385,7 @@ const I18N = {
     busy_camera_err: "Camera error",
     busy_queue: "Queue #",
     busy_resetting: "Resetting session",
+    busy_switching: "Switching prompt",
     hint_no_face: "Face the camera and show your full face 😊",
     hint_no_person: "No person detected, please step back into frame 😊",
     gate_too_close: "Show your upper body (sit up / move your face to the upper half)",
@@ -578,6 +580,11 @@ function stopRecordDrain() {
   if (finalizeWatchdog) { clearTimeout(finalizeWatchdog); finalizeWatchdog = null; }
 }
 let startingRun = false;
+// A prompt change intentionally creates a fresh model session. Keep the
+// currently decoded stream alive during that teardown, and remember a newer
+// click instead of silently dropping it while a prior restart is in flight.
+let promptTransitionActive = false;
+let promptRestartQueued = false;
 let sessionGranted = false;
 let peCache = null;
 let pendingPeCacheKey = null;
@@ -1575,11 +1582,11 @@ function startVideoPull() {
 }
 function stopVideoPull() { videoPullActive = false; }
 
-async function beginSession() {
+async function beginSession({ preserveContinuity = false } = {}) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  resetRunMetrics();
+  if (!preserveContinuity) resetRunMetrics();
   pePausedSend = false;
-  clearResultVideo();
+  if (!preserveContinuity) clearResultVideo();
   if (usingVideoFile) {
     camera.loop = false;
     try { camera.pause(); } catch (err) {}
@@ -1683,23 +1690,56 @@ async function start() {
         return;
       }
       if (msg.type === "started") {
-        activeUplinkCodec = (msg.uplink_codec === "h264") ? "h264" : "jpeg";
-        teardownUplinkEncoder();
+        // If the user selected another prompt while teardown was running,
+        // immediately apply the latest selection. Do not start sending frames
+        // into the now-obsolete intermediate session or require a second click.
+        if (promptRestartQueued) {
+          promptRestartQueued = false;
+          promptTransitionActive = false;
+          startingRun = false;
+          setSendBusy(true, t("busy_switching"));
+          void send();
+          return;
+        }
+
+        const preserveDownlink = (
+          promptTransitionActive &&
+          activeDownlinkCodec === ((msg.downlink_codec === "h264") ? "h264" : "jpeg") &&
+          (
+            activeDownlinkCodec !== "h264" ||
+            (downlinkDecoder && !downlinkDecoderError && downlinkDecoder.state !== "closed")
+          )
+        );
+        const nextUplinkCodec = (msg.uplink_codec === "h264") ? "h264" : "jpeg";
+        const preserveUplinkTimeline = (
+          promptTransitionActive &&
+          activeUplinkCodec === "h264" &&
+          nextUplinkCodec === "h264"
+        );
+        activeUplinkCodec = nextUplinkCodec;
         if (activeUplinkCodec === "h264") {
-          try { setupUplinkEncoder(); }
+          try { setupUplinkEncoder(preserveUplinkTimeline); }
           catch (err) { activeUplinkCodec = "jpeg"; teardownUplinkEncoder(); }
+        } else {
+          teardownUplinkEncoder();
         }
         activeDownlinkCodec = (msg.downlink_codec === "h264") ? "h264" : "jpeg";
-        teardownDownlinkDecoder();
-        if (activeDownlinkCodec === "h264") {
-          try { setupDownlinkDecoder(); }
-          catch (err) { activeDownlinkCodec = "jpeg"; teardownDownlinkDecoder(); }
+        // The server starts every new H.264 chunk with an IDR. Reusing the
+        // compatible decoder lets it finish old-prompt frames already queued
+        // for display, while safely accepting the fresh encoder stream.
+        if (!preserveDownlink) {
+          teardownDownlinkDecoder();
+          if (activeDownlinkCodec === "h264") {
+            try { setupDownlinkDecoder(); }
+            catch (err) { activeDownlinkCodec = "jpeg"; teardownDownlinkDecoder(); }
+          }
         }
         if (usingVideoFile) {
           try { camera.pause(); } catch (err) {}
           try { camera.currentTime = 0; } catch (err) {}
         }
         startingRun = false;
+        promptTransitionActive = false;
         pePausedSend = false;
         setSendBusy(false, t("busy_running"));
         outputWaitingFace = false;
@@ -1938,6 +1978,8 @@ async function start() {
     resultEpoch += 1;
     ws = null;
     startingRun = false;
+    promptTransitionActive = false;
+    promptRestartQueued = false;
     sessionGranted = false;
     setSendBusy(false, t("busy_disconnected"));
     showOutputIdle(true);
@@ -1963,6 +2005,8 @@ function stopActiveRun() {
   outputPlaybackTimer = null;
   outputPlaybackIntervalMs = null;
   clearOutputQueue();
+  promptTransitionActive = false;
+  promptRestartQueued = false;
   const currentWs = ws;
   ws = null;
   if (currentWs) {
@@ -1978,19 +2022,23 @@ function stopActiveRun() {
 }
 
 async function send() {
-  if (startingRun) return;
+  if (startingRun) {
+    promptRestartQueued = true;
+    setSendBusy(true, t("busy_switching"));
+    return;
+  }
   if (ws && ws.readyState === WebSocket.OPEN && sessionGranted) {
     startingRun = true;
-    setSendBusy(true, t("busy_resetting"));
+    promptTransitionActive = true;
+    setSendBusy(true, t("busy_switching"));
     if (timer) clearInterval(timer);
     timer = null;
     stopVideoPull();
     try { if (usingVideoFile) camera.pause(); } catch (err) {}
-    clearResultVideo();
-    clearOutputQueue();
-    const ok = await beginSession();
+    const ok = await beginSession({ preserveContinuity: true });
     if (ok) return;
     startingRun = false;
+    promptTransitionActive = false;
     sessionGranted = false;
   }
   stopActiveRun();

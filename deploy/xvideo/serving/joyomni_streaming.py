@@ -132,6 +132,11 @@ class _DecodedPixelsChunk:
     decoded_pixels: torch.Tensor
     ready_event: torch.cuda.Event | None = None
 
+
+class _SessionCancelled(RuntimeError):
+    """Internal control flow used to abandon an old prompt's queued work."""
+
+
 def _module_device(module: torch.nn.Module) -> torch.device:
     if hasattr(module, "device"):
         return torch.device(module.device)
@@ -644,6 +649,8 @@ class JoyOmniV2VStreamingSession:
         self.streaming_cond_embeds: torch.Tensor | None = None
         self.streaming_cond_mask: torch.Tensor | None = None
         self.last_chunk_profile: dict[str, Any] | None = None
+        self.last_initialize_profile: dict[str, float] | None = None
+        self.last_close_profile: dict[str, float | int] | None = None
 
         self._encode_queue: queue.Queue[_ChunkJob | None] | None = None
         self._dit_queue: queue.Queue[_EncodedChunk | None] | None = None
@@ -655,6 +662,7 @@ class JoyOmniV2VStreamingSession:
         self._workers: list[threading.Thread] = []
         self._worker_error: BaseException | None = None
         self._worker_error_lock = threading.Lock()
+        self._cancel_pending = threading.Event()
         self._pseudo_latent_condition = threading.Condition()
         self._pseudo_latent_chunk_idx: int | None = None
         self._pseudo_latent: torch.Tensor | None = None
@@ -688,6 +696,11 @@ class JoyOmniV2VStreamingSession:
             "postprocessed_chunks": 0,
             "returned_results": 0,
             "dropped_results": 0,
+            "cancelled_encode_chunks": 0,
+            "cancelled_dit_chunks": 0,
+            "cancelled_decode_chunks": 0,
+            "cancelled_pseudo_chunks": 0,
+            "cancelled_postprocess_chunks": 0,
         }
 
     def _new_stage_stream(self, device: torch.device | str) -> torch.cuda.Stream | None:
@@ -888,13 +901,34 @@ class JoyOmniV2VStreamingSession:
         self._submit_or_process_chunk(chunk_frames, chunk_metas)
         return source_count
 
-    def close(self) -> list[StreamingChunkResult]:
+    def close(self, *, drop_pending: bool = False) -> list[StreamingChunkResult]:
         # Quiesce the pipeline before mutating feature/KV caches.  Workers may
         # still be draining queued chunks during warmup, restart, or a client
         # disconnect; clearing live cache state races their model forwards.
-        completed = self._stop_async_workers()
+        close_started = time.perf_counter()
+        phase_started = close_started
+        completed = self._stop_async_workers(drop_pending=drop_pending)
+        workers_s = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         self._clear_vae_feature_caches()
         self.pipeline.transformer.reset_inference_kv_cache()
+        cache_reset_s = time.perf_counter() - phase_started
+        self.last_close_profile = {
+            "workers_s": workers_s,
+            "cache_reset_s": cache_reset_s,
+            "completed_chunks": len(completed),
+            "drop_pending": int(drop_pending),
+            "total_s": time.perf_counter() - close_started,
+        }
+        print(
+            "#####[SESSION-CLOSE] "
+            f"total={self.last_close_profile['total_s']:.3f}s "
+            f"workers={workers_s:.3f}s "
+            f"cache_reset={cache_reset_s:.3f}s "
+            f"completed_chunks={len(completed)} "
+            f"drop_pending={int(drop_pending)}",
+            flush=True,
+        )
         return completed
 
     @torch.no_grad()
@@ -902,18 +936,28 @@ class JoyOmniV2VStreamingSession:
         if self.initialized:
             return
 
+        initialize_started = time.perf_counter()
+        initialize_profile: dict[str, float] = {}
+
         if not getattr(self.pipeline.transformer.config, "causal", False):
             raise ValueError("Online streaming requires a causal transformer config.")
         self.pipeline.transformer.config.use_inference_kv_cache = True
         self.pipeline._interrupt = False
 
+        phase_started = time.perf_counter()
         self.ref_image_latent = self._encode_ref_image_latent()
+        initialize_profile["reference_encode_s"] = time.perf_counter() - phase_started
 
+        phase_started = time.perf_counter()
         self._encode_streaming_prompt(first_frame)
+        initialize_profile["prompt_encode_s"] = time.perf_counter() - phase_started
 
+        phase_started = time.perf_counter()
         self._clear_vae_feature_caches()
         self.pipeline.transformer.reset_inference_kv_cache()
+        initialize_profile["cache_reset_s"] = time.perf_counter() - phase_started
         if self.ref_image_latent is not None:
+            phase_started = time.perf_counter()
             self.pipeline._prefill_static_reference_kv_cache(
                 self.pipeline.transformer,
                 prompt_embeds=self.streaming_cond_embeds,
@@ -922,8 +966,20 @@ class JoyOmniV2VStreamingSession:
                 transformer_dtype=self.target_dtype,
             )
             self.ref_image_kv_prefilled = True
+            initialize_profile["reference_prefill_s"] = time.perf_counter() - phase_started
 
         self.initialized = True
+        initialize_profile["total_s"] = time.perf_counter() - initialize_started
+        self.last_initialize_profile = initialize_profile
+        print(
+            "#####[SESSION-INIT] "
+            f"total={initialize_profile['total_s']:.3f}s "
+            f"prompt={initialize_profile['prompt_encode_s']:.3f}s "
+            f"ref_encode={initialize_profile['reference_encode_s']:.3f}s "
+            f"ref_prefill={initialize_profile.get('reference_prefill_s', 0.0):.3f}s "
+            f"cache_reset={initialize_profile['cache_reset_s']:.3f}s",
+            flush=True,
+        )
 
     @torch.no_grad()
     def _encode_streaming_prompt(self, anchor_frame: Image.Image) -> None:
@@ -1397,9 +1453,20 @@ class JoyOmniV2VStreamingSession:
         for worker in self._workers:
             worker.start()
 
-    def _stop_async_workers(self) -> list[StreamingChunkResult]:
+    def _stop_async_workers(self, *, drop_pending: bool = False) -> list[StreamingChunkResult]:
         if self._encode_queue is None:
             return []
+        if drop_pending:
+            # A prompt switch invalidates old queued frames. Stop launching
+            # additional work at every stage, but still join all workers and
+            # synchronize their one already-running GPU operation before cache
+            # state is cleared. This retains the teardown safety barrier while
+            # avoiding inference whose output the user no longer wants.
+            self._cancel_pending.set()
+            self.pending_frames.clear()
+            self.pending_metas.clear()
+            with self._pseudo_latent_condition:
+                self._pseudo_latent_condition.notify_all()
         try:
             self._encode_queue.put(None, timeout=0.1)
         except queue.Full:
@@ -1419,6 +1486,20 @@ class JoyOmniV2VStreamingSession:
         self._result_queue = None
         self._workers = []
         return completed
+
+    def _discard_cancelled_chunk(self, stage: str, chunk_idx: int) -> bool:
+        if not self._cancel_pending.is_set():
+            return False
+        self._set_debug_state(stage, "cancelled", chunk_idx)
+        counter = {
+            "vae-encode": "cancelled_encode_chunks",
+            "dit-denoise": "cancelled_dit_chunks",
+            "vae-decode": "cancelled_decode_chunks",
+            "pseudo-encode": "cancelled_pseudo_chunks",
+            "postprocess": "cancelled_postprocess_chunks",
+        }[stage]
+        self._inc_debug_counter(counter)
+        return True
 
     def _set_worker_error(self, exc: BaseException) -> None:
         import traceback as _tb
@@ -1505,6 +1586,8 @@ class JoyOmniV2VStreamingSession:
             "counters": counters,
             "pseudo_latent_chunk_idx": self._pseudo_latent_chunk_idx,
             "last_chunk_profile": self.last_chunk_profile,
+            "last_initialize_profile": self.last_initialize_profile,
+            "last_close_profile": self.last_close_profile,
             "devices": {
                 "dit": str(self.device),
                 "vae_encode": str(_module_device(self.pipeline.vae)),
@@ -1580,6 +1663,8 @@ class JoyOmniV2VStreamingSession:
                 self._set_debug_state("vae-encode", "stop")
                 self._dit_queue.put(None)
                 return
+            if self._discard_cancelled_chunk("vae-encode", job.chunk_idx):
+                continue
             self._record_queue_wait(job.profile, "q_wait_encode_s", _q_started)
             try:
                 self._set_debug_state("vae-encode", "encode", job.chunk_idx)
@@ -1592,6 +1677,8 @@ class JoyOmniV2VStreamingSession:
                     )
                     self._timer_record(job.profile, "reference_prepare_s", started)
                     ready_event = self._record_stage_ready(self._encode_stream)
+                if self._discard_cancelled_chunk("vae-encode", job.chunk_idx):
+                    continue
                 self._set_debug_state("vae-encode", "put_dit_queue", job.chunk_idx)
                 self._dit_queue.put(_EncodedChunk(
                     job=job,
@@ -1616,6 +1703,8 @@ class JoyOmniV2VStreamingSession:
                 self._set_debug_state("dit-denoise", "stop")
                 self._decode_queue.put(None)
                 return
+            if self._discard_cancelled_chunk("dit-denoise", encoded.job.chunk_idx):
+                continue
             self._record_queue_wait(encoded.job.profile, "q_wait_dit_s", _q_started)
             try:
                 with self.runtime.dit_lock:
@@ -1636,6 +1725,8 @@ class JoyOmniV2VStreamingSession:
                             frozen_anchor_id=encoded.job.frozen_anchor_id,
                         )
                         ready_event = self._record_stage_ready(self._dit_stream)
+                if self._discard_cancelled_chunk("dit-denoise", encoded.job.chunk_idx):
+                    continue
                 self._set_debug_state("dit-denoise", "put_decode_queue", encoded.job.chunk_idx)
                 self._decode_queue.put(
                     _DenoisedChunk(
@@ -1666,6 +1757,8 @@ class JoyOmniV2VStreamingSession:
                     self._pseudo_queue.put(None)
                 self._postprocess_queue.put(None)
                 return
+            if self._discard_cancelled_chunk("vae-decode", denoised.job.chunk_idx):
+                continue
             self._record_queue_wait(denoised.job.profile, "q_wait_decode_s", _q_started)
             try:
                 self._set_debug_state("vae-decode", "decode_pixels", denoised.job.chunk_idx)
@@ -1681,6 +1774,9 @@ class JoyOmniV2VStreamingSession:
                         chunk_idx=denoised.job.chunk_idx,
                     )
                     ready_event = self._record_stage_ready(self._decode_stream)
+
+                if self._discard_cancelled_chunk("vae-decode", denoised.job.chunk_idx):
+                    continue
 
                 if self._pseudo_queue is not None:
                     self._set_debug_state(
@@ -1702,6 +1798,9 @@ class JoyOmniV2VStreamingSession:
                     )
                 )
                 self._inc_debug_counter("decoded_pixel_chunks")
+            except _SessionCancelled:
+                self._discard_cancelled_chunk("vae-decode", denoised.job.chunk_idx)
+                continue
             except BaseException as exc:
                 self._set_debug_state("vae-decode", "error", denoised.job.chunk_idx)
                 self._set_worker_error(exc)
@@ -1719,6 +1818,8 @@ class JoyOmniV2VStreamingSession:
             if decoded is None:
                 self._set_debug_state("pseudo-encode", "stop")
                 return
+            if self._discard_cancelled_chunk("pseudo-encode", decoded.job.chunk_idx):
+                continue
             self._record_queue_wait(decoded.job.profile, "q_wait_pseudo_s", _q_started)
             try:
                 self._set_debug_state("pseudo-encode", "pseudo_encode", decoded.job.chunk_idx)
@@ -1731,6 +1832,8 @@ class JoyOmniV2VStreamingSession:
                         profile=decoded.job.profile,
                         chunk_idx=decoded.job.chunk_idx,
                     )
+                if self._discard_cancelled_chunk("pseudo-encode", decoded.job.chunk_idx):
+                    continue
                 self._inc_debug_counter("pseudo_encoded_chunks")
             except BaseException as exc:
                 self._set_debug_state("pseudo-encode", "error", decoded.job.chunk_idx)
@@ -1748,6 +1851,8 @@ class JoyOmniV2VStreamingSession:
             if decoded is None:
                 self._set_debug_state("postprocess", "stop")
                 return
+            if self._discard_cancelled_chunk("postprocess", decoded.job.chunk_idx):
+                continue
             self._record_queue_wait(decoded.job.profile, "q_wait_postprocess_s", _q_started)
             try:
                 self._set_debug_state("postprocess", "pack_frames", decoded.job.chunk_idx)
@@ -1760,6 +1865,9 @@ class JoyOmniV2VStreamingSession:
                         profile=decoded.job.profile,
                         chunk_idx=decoded.job.chunk_idx,
                     )
+
+                if self._discard_cancelled_chunk("postprocess", decoded.job.chunk_idx):
+                    continue
 
                 n_out = int(packed.shape[0])
                 self._finish_chunk_profile(
@@ -1887,6 +1995,8 @@ class JoyOmniV2VStreamingSession:
     ) -> torch.Tensor:
         while True:
             with self._pseudo_latent_condition:
+                if self._cancel_pending.is_set():
+                    raise _SessionCancelled()
                 if self._pseudo_latent_chunk_idx == chunk_idx and self._pseudo_latent is not None:
                     pseudo_latent = self._pseudo_latent
                     ready_event = self._pseudo_latent_ready_event
@@ -1895,6 +2005,8 @@ class JoyOmniV2VStreamingSession:
                     self._pseudo_latent_ready_event = None
                     break
                 self._pseudo_latent_condition.wait(timeout=0.05)
+            if self._cancel_pending.is_set():
+                raise _SessionCancelled()
             self._raise_worker_error_if_needed()
         self._wait_stage_ready(
             self._decode_stream, ready_event, pseudo_latent

@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from PIL import Image, ImageChops, ImageStat
 import uvicorn
 
+from xvideo.config import generate_video_image_bucket
 from xvideo.serving.pe import DEFAULT_MODEL as DEFAULT_PE_MODEL
 from xvideo.serving.joyomni_streaming import (
     JoyOmniRuntime,
@@ -164,6 +165,76 @@ def _ref_images_cached() -> dict[str, str]:
     if _REF_IMAGES_CACHE is None:
         _REF_IMAGES_CACHE = _load_ref_images()
     return _REF_IMAGES_CACHE
+
+
+def _warm_reference_prefill_paths(runtime: JoyOmniRuntime, args: argparse.Namespace) -> None:
+    """Compile every reference-image bucket before the first browser session.
+
+    Reference KV prefill is a separate dynamic DiT path. Its first unseen
+    latent sequence length can otherwise spend tens of seconds compiling after
+    a prompt switch. Startup cost is preferable to an interactive stall, so
+    exercise all 49 supported reference buckets on the persistent frame-submit
+    thread after the final process-wide PyTorch state has been established.
+    """
+    base_size = int(getattr(runtime.cfg, "ref_image_basesize", 512))
+    buckets = generate_video_image_bucket(
+        img_basesize=base_size,
+        bs_img=1,
+        bs_vid=0,
+        bs_mimg=0,
+        bs_mvid=0,
+    )
+    reference_hw = sorted({(int(item[3]), int(item[4])) for item in buckets})
+    settings = StreamingSettings(
+        height=args.height,
+        width=args.width,
+        num_inference_steps=args.num_inference_steps,
+        max_temporal_ids=args.max_temporal_ids,
+        freeze_kv_on_static=args.freeze_kv_on_static,
+        static_diff_thresh=args.static_diff_thresh,
+        exact_global_sink_kv=bool(args.exact_global_sink_kv),
+        profile_timings=False,
+    )
+    anchor = Image.new("RGB", (args.width, args.height), (127, 127, 127))
+    started = time.perf_counter()
+    slow_paths = 0
+    print(
+        f"#####[STREAM] reference-prefill warmup: {len(reference_hw)} buckets",
+        flush=True,
+    )
+    for index, (height, width) in enumerate(reference_hw, start=1):
+        session = runtime.create_v2v_session(
+            prompt=args.prompt,
+            settings=settings,
+            ref_image=Image.new("RGB", (width, height), (127, 127, 127)),
+        )
+        path_started = time.perf_counter()
+        try:
+            # push_frame performs reference initialization and establishes the
+            # normal worker/stream lifecycle. close(drop_pending=True) then
+            # cancels the synthetic output chunk while still synchronizing the
+            # GPU before it clears the warmup session's caches.
+            session.push_frame(
+                anchor,
+                frame_meta={"seq": 1, "t_capture_ms": 0.0},
+                drain_results=False,
+            )
+        finally:
+            session.close(drop_pending=True)
+        elapsed = time.perf_counter() - path_started
+        if elapsed >= 1.0:
+            slow_paths += 1
+            print(
+                f"#####[STREAM] reference-prefill bucket {index}/{len(reference_hw)} "
+                f"{height}x{width} warmed in {elapsed:.1f}s",
+                flush=True,
+            )
+    print(
+        "#####[STREAM] reference-prefill warmup complete: "
+        f"{len(reference_hw)} buckets, {slow_paths} cold paths, "
+        f"{time.perf_counter() - started:.1f}s",
+        flush=True,
+    )
 
 
 _INDEX_HTML_PATH = Path(__file__).resolve().parents[2] / "static" / "index.html"
@@ -789,6 +860,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     _app.state.frame_executor,
                     live_warmup,
                 )
+                if os.environ.get(
+                    "JOYOMNI_WARMUP_REFERENCE_PATHS", "0"
+                ).lower() not in {"0", "false", "no", "off"}:
+                    await asyncio.get_running_loop().run_in_executor(
+                        _app.state.frame_executor,
+                        _warm_reference_prefill_paths,
+                        runtime,
+                        args,
+                    )
             yield
         finally:
             await asyncio.to_thread(
@@ -1429,11 +1509,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 )
             return None
 
-        def _close_session_sync(session_ref, flush_pending: bool):
+        def _close_session_sync(session_ref, flush_pending: bool, drop_pending: bool):
             padded_source_frames = 0
             if flush_pending:
                 padded_source_frames = session_ref.flush_pending_for_reset()
-            completed = session_ref.close()
+            completed = session_ref.close(drop_pending=drop_pending)
             return padded_source_frames, completed
 
         async def _close_session_safely(
@@ -1441,6 +1521,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             reason: str,
             *,
             flush_pending: bool = False,
+            drop_pending: bool = False,
         ) -> tuple[bool, int, list[Any]]:
             try:
                 padded_source_frames, completed = await asyncio.wait_for(
@@ -1449,6 +1530,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         _close_session_sync,
                         session_ref,
                         flush_pending,
+                        drop_pending,
                     ),
                     timeout=max(0.1, float(args.session_close_timeout_s)),
                 )
@@ -1657,13 +1739,41 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     payload = json.loads(message["text"])
                     msg_type = payload.get("type")
                     if msg_type == "start":
+                        restart_started = time.perf_counter()
+                        restart_profile: dict[str, Any] = {
+                            "had_live_session": bool(session is not None),
+                        }
                         print(f"#####[RESTART] 'start' received (session {'live' if session is not None else 'none'})", flush=True)
                         last_activity = time.monotonic()
                         if session is not None:
+                            pre_close_snapshot = session.debug_snapshot()
+                            restart_profile["pending_frames_before"] = int(
+                                pre_close_snapshot.get("pending_frames") or 0
+                            )
+                            restart_profile["queues_before"] = dict(
+                                pre_close_snapshot.get("queues") or {}
+                            )
+                            restart_profile["worker_states_before"] = dict(
+                                pre_close_snapshot.get("worker_states") or {}
+                            )
                             print("#####[RESTART] tearing down prior session: stop_output_task", flush=True)
+                            phase_started = time.perf_counter()
                             await _stop_output_task()
+                            restart_profile["stop_output_s"] = time.perf_counter() - phase_started
                             print("#####[RESTART] close_session", flush=True)
-                            closed, _, _ = await _close_session_safely(session, "restart")
+                            phase_started = time.perf_counter()
+                            closed, padded_source_frames, completed = await _close_session_safely(
+                                session,
+                                "restart",
+                                flush_pending=False,
+                                drop_pending=True,
+                            )
+                            restart_profile["close_session_s"] = time.perf_counter() - phase_started
+                            restart_profile["close_profile"] = dict(
+                                getattr(session, "last_close_profile", None) or {}
+                            )
+                            restart_profile["padded_source_frames"] = padded_source_frames
+                            restart_profile["completed_chunks"] = len(completed)
                             if not closed:
                                 await _send_json(
                                     {
@@ -1672,6 +1782,17 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                                     }
                                 )
                                 break
+                            # Preserve every result that the intentional full
+                            # teardown had to finish.  Previously close() paid
+                            # this cost and then discarded the completed old-
+                            # prompt chunks, starving the browser's continuity
+                            # buffer for the entire restart interval.
+                            phase_started = time.perf_counter()
+                            drained_frames = 0
+                            for result in completed:
+                                drained_frames += await _send_chunk_result(result)
+                            restart_profile["send_completed_s"] = time.perf_counter() - phase_started
+                            restart_profile["completed_frames_sent"] = drained_frames
                             print("#####[RESTART] prior session closed OK", flush=True)
                             if getattr(app.state, "active_session", None) is session:
                                 app.state.active_session = None
@@ -1803,7 +1924,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         )
 
                         print("#####[RESTART] creating new session", flush=True)
+                        phase_started = time.perf_counter()
                         session = _create_session()
+                        restart_profile["create_session_s"] = time.perf_counter() - phase_started
                         print("#####[RESTART] new session created; sending 'started'", flush=True)
                         app.state.active_session = session
                         frames_since_session_reset = 0
@@ -1821,6 +1944,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         ws_debug["frames_since_session_reset"] = frames_since_session_reset
                         ws_debug["has_ref_image"] = ref_image is not None
                         ws_debug["last_message_type"] = "start"
+                        phase_started = time.perf_counter()
                         if uplink_decoder is not None:
                             uplink_decoder.close()
                             uplink_decoder = None
@@ -1856,6 +1980,21 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         else:
                             downlink_codec = "jpeg"
                         ws_debug["downlink_codec"] = downlink_codec
+                        restart_profile["codec_setup_s"] = time.perf_counter() - phase_started
+                        restart_profile["total_to_started_s"] = time.perf_counter() - restart_started
+                        ws_debug["last_restart_profile"] = dict(restart_profile)
+                        print(
+                            "#####[RESTART-TIMING] "
+                            + " ".join(
+                                f"{key}={value:.3f}s"
+                                for key, value in restart_profile.items()
+                                if isinstance(value, float)
+                            )
+                            + f" completed_chunks={restart_profile.get('completed_chunks', 0)}"
+                            + f" pending_frames={restart_profile.get('pending_frames_before', 0)}"
+                            + f" queue_depth={sum(v for v in (restart_profile.get('queues_before') or {}).values() if isinstance(v, int))}",
+                            flush=True,
+                        )
                         await _send_json(
                             {
                                 "type": "started",
@@ -1873,6 +2012,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                                 "scene_cut_threshold": scene_cut_threshold,
                                 "uplink_codec": uplink_codec,
                                 "downlink_codec": downlink_codec,
+                                "restart_profile": restart_profile,
                             }
                         )
                         _start_recorders()

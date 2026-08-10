@@ -1,6 +1,6 @@
 # JoyAI Video Edit ROCm/gfx950 handoff
 
-Prepared 2026-08-08 and updated 2026-08-09 from upstream commit
+Prepared 2026-08-08 and updated 2026-08-10 from upstream commit
 `231aab0d32f62fefc853cf9a046b8f29b4a39dfd`.
 
 This branch contains the ROCm/gfx950 port, native wave64
@@ -70,6 +70,12 @@ Completed and validated on an MI350X (`gfx950`):
 - Direct H.264/JPEG delivery, single-consumer ordered output, a locked PyAV
   encoder lifecycle, bounded result backpressure, safer worker shutdown, and
   output-pump error handling.
+- Seamless prompt switching while retaining the intentional full session/cache
+  teardown: queued old-prompt chunks are cancelled, the running GPU operation
+  is synchronized before caches are cleared, the browser keeps its playback
+  buffer and compatible H.264 decoder, and rapid selections coalesce to the
+  latest prompt instead of silently requiring a second click. All supported
+  reference-image buckets are compiled during startup rather than on first use.
 - Event-ordered encode, DiT, decode, pseudo-encode, and postprocess streams on
   one physical GPU. The qualified pseudo-context VAE path avoids the compiled
   stateful VAE replay issue, and independent per-session GPU generators make
@@ -245,8 +251,12 @@ hybrid-KV preset (`JOYOMNI_STATEFUL_VAE=0`,
 (`JOYOMNI_FP8_IMG=1` and `JOYOMNI_FP8_TXT=1`), plus the dynamic full-graph DiT preset
 (`JOYOMNI_DIT_COMPILE_MODE=default`,
 `JOYOMNI_DIT_COMPILE_FULLGRAPH=1`, and
-`JOYOMNI_DIT_COMPILE_DYNAMIC=1`). Compilation can take several minutes; this
-is intentional because warmed throughput is the deployment objective. Set
+`JOYOMNI_DIT_COMPILE_DYNAMIC=1`). It also sets
+`JOYOMNI_WARMUP_REFERENCE_PATHS=1`, which exercises all 49 reference-image
+buckets after the final live-thread warmup. A first clean launch can therefore
+take substantially longer than the text-only warmup; wait for `/health` before
+opening the UI. This is intentional because warmed interactive behavior is the
+deployment objective. Set
 `JOYOMNI_DIT_COMPILE_MODE` to an empty string for an eager A/B run. Set
 `JOYOMNI_CACHE_LAST_DENOISE_KV=0` for the slower exact all-layer cache policy.
 
@@ -468,6 +478,13 @@ Native and runtime validation record:
 - Static Python compilation, focused CPU units, scheduler parity, PyAV H.264
   round trips, mocked WebSocket flow, bounded-queue behavior, and concurrent
   encoder lifecycle tests passed.
+- Prompt-switch tracing isolated the old outlier to cold reference-KV graph
+  specializations (25-29 seconds for an unseen bucket), not cache teardown.
+  After warmup, idle live restarts were 0.04-0.07 seconds, a deliberately
+  backlogged restart was 0.47-0.56 seconds end to end, and reference first
+  output was 0.48 seconds. Cancellation preserved the worker/device
+  synchronization barrier and a continuous decoder accepted all cross-session
+  H.264 packets without errors.
 - Full warmup, the prefix-24 60-second live benchmark, the 360-input motion/cut
   capture, a full selected-region rocprof capture, and a controlled HTTPS/WSS
   protocol run all completed successfully on the destination host.

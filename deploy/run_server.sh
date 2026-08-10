@@ -64,6 +64,10 @@ if [ -n "${ROCR_VISIBLE_DEVICES:-}" ]; then
   export JOYOMNI_DIT_RECOMPILE_LIMIT="${JOYOMNI_DIT_RECOMPILE_LIMIT:-32}"
   export JOYOMNI_DIT_ACCUMULATED_RECOMPILE_LIMIT="${JOYOMNI_DIT_ACCUMULATED_RECOMPILE_LIMIT:-256}"
   export JOYOMNI_DIT_COMPILE_WARMUP_CHUNKS="${JOYOMNI_DIT_COMPILE_WARMUP_CHUNKS:-3}"
+  # Reference-image KV prefill has separate sequence-length specializations.
+  # Pay that cost at startup so built-in or uploaded reference prompts never
+  # stall the live stream on their first use.
+  export JOYOMNI_WARMUP_REFERENCE_PATHS="${JOYOMNI_WARMUP_REFERENCE_PATHS:-1}"
 fi
 
 # ---- recording ----
