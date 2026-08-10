@@ -913,9 +913,20 @@ class JoyOmniV2VStreamingSession:
         self._clear_vae_feature_caches()
         self.pipeline.transformer.reset_inference_kv_cache()
         cache_reset_s = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
+        # A prompt switch is already a full synchronized teardown. Release
+        # only the allocator's now-unused blocks here, as upstream did, so
+        # distinct prompt sessions cannot ratchet cached VRAM upward until an
+        # emergency OOM purge stalls the next first frame. This does not move
+        # weights or live tensors to CPU; all model roles remain on one GPU.
+        if self.device_type == "cuda" and torch.cuda.is_available():
+            with torch.cuda.device(self.device):
+                torch.cuda.empty_cache()
+        allocator_release_s = time.perf_counter() - phase_started
         self.last_close_profile = {
             "workers_s": workers_s,
             "cache_reset_s": cache_reset_s,
+            "allocator_release_s": allocator_release_s,
             "completed_chunks": len(completed),
             "drop_pending": int(drop_pending),
             "total_s": time.perf_counter() - close_started,
@@ -925,6 +936,7 @@ class JoyOmniV2VStreamingSession:
             f"total={self.last_close_profile['total_s']:.3f}s "
             f"workers={workers_s:.3f}s "
             f"cache_reset={cache_reset_s:.3f}s "
+            f"allocator_release={allocator_release_s:.3f}s "
             f"completed_chunks={len(completed)} "
             f"drop_pending={int(drop_pending)}",
             flush=True,

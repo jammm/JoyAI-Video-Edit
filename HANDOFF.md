@@ -74,8 +74,13 @@ Completed and validated on an MI350X (`gfx950`):
   teardown: queued old-prompt chunks are cancelled, the running GPU operation
   is synchronized before caches are cleared, the browser keeps its playback
   buffer and compatible H.264 decoder, and rapid selections coalesce to the
-  latest prompt instead of silently requiring a second click. All supported
-  reference-image buckets are compiled during startup rather than on first use.
+  latest prompt instead of silently requiring a second click. The browser also
+  fences late WebCodecs callbacks before sending the next `start`, so an old
+  prompt's H.264 delta packet cannot enter the new server decoder. After the
+  synchronized teardown, unused GPU allocator blocks are released to prevent
+  distinct prompts from ratcheting cached HBM upward; weights and live tensors
+  remain on the same GPU. All supported reference-image buckets are compiled
+  during startup rather than on first use.
 - Event-ordered encode, DiT, decode, pseudo-encode, and postprocess streams on
   one physical GPU. The qualified pseudo-context VAE path avoids the compiled
   stateful VAE replay issue, and independent per-session GPU generators make
@@ -485,6 +490,18 @@ Native and runtime validation record:
   output was 0.48 seconds. Cancellation preserved the worker/device
   synchronization barrier and a continuous decoder accepted all cross-session
   H.264 packets without errors.
+- A repeated-switch browser qualification used a 1248x720, 24 FPS virtual
+  camera device backed by a moving-person source. The page acquired it through
+  its normal `getUserMedia` path and used the production WebCodecs H.264
+  uplink/downlink; the MP4-upload path was not used. Fifteen consecutive prompt
+  changes completed without a codec error, decoder restart, second click, or
+  output-buffer underrun. The output queue stayed at least seven frames deep;
+  prompt acknowledgement was 186.9-353.1 ms and the first new output arrived
+  in 705.2-979.6 ms. Active-session HBM stayed within 100.97-103.58 GiB instead
+  of growing by about 21 GiB per prompt as it did before allocator release.
+  The headless test's canvas scheduler had brief 82.6-187.3 ms handoff gaps
+  while the decoded queue remained nonempty; these were client rendering
+  jitter, not network/backend starvation or multi-second stream interruption.
 - Full warmup, the prefix-24 60-second live benchmark, the 360-input motion/cut
   capture, a full selected-region rocprof capture, and a controlled HTTPS/WSS
   protocol run all completed successfully on the destination host.

@@ -651,6 +651,7 @@ let uplinkEncoderError = false;
 let uplinkForceKeyframe = false;
 let uplinkFrameIndex = 0;
 let uplinkPendingMeta = [];
+let uplinkEncoderEpoch = 0;
 
 async function probeUplinkH264() {
   if (uplinkH264Supported !== null) return uplinkH264Supported;
@@ -678,25 +679,33 @@ async function probeUplinkH264() {
   return uplinkH264Supported;
 }
 
-function teardownUplinkEncoder() {
+function teardownUplinkEncoder(preserveTimeline = false) {
+  const preservedFrameIndex = preserveTimeline ? uplinkFrameIndex : 0;
+  // Invalidate callbacks before close(). A WebCodecs encoder may already have
+  // completed output queued on the event loop; without this fence, an old
+  // prompt's late delta packet can cross the subsequent `start` message and
+  // poison the server's newly-created H.264 decoder.
+  uplinkEncoderEpoch += 1;
   if (uplinkEncoder) {
     try { if (uplinkEncoder.state !== "closed") uplinkEncoder.close(); } catch (err) {}
   }
   uplinkEncoder = null;
   uplinkEncoderError = false;
   uplinkForceKeyframe = false;
-  uplinkFrameIndex = 0;
+  uplinkFrameIndex = preservedFrameIndex;
   uplinkPendingMeta = [];
 }
 
 function setupUplinkEncoder(preserveTimeline = false) {
   const resumeFrameIndex = preserveTimeline ? uplinkFrameIndex : 0;
-  teardownUplinkEncoder();
+  teardownUplinkEncoder(preserveTimeline);
+  const encoderEpoch = uplinkEncoderEpoch;
   const w = Number(document.getElementById("width").value);
   const h = Number(document.getElementById("height").value);
   const enc = new VideoEncoder({
     output: (chunk, metadata) => {
       try {
+        if (encoderEpoch !== uplinkEncoderEpoch) return;
         if (!ws || ws.readyState !== WebSocket.OPEN) { uplinkPendingMeta.shift(); return; }
         const meta = uplinkPendingMeta.shift() || { seq: sentFrames + 1, t_capture_ms: Date.now() };
         const buf = new ArrayBuffer(chunk.byteLength);
@@ -708,10 +717,12 @@ function setupUplinkEncoder(preserveTimeline = false) {
         sentFramesWindow += 1;
         updateMetrics();
       } catch (err) {
-        uplinkEncoderError = true;
+        if (encoderEpoch === uplinkEncoderEpoch) uplinkEncoderError = true;
       }
     },
-    error: (err) => { uplinkEncoderError = true; },
+    error: (err) => {
+      if (encoderEpoch === uplinkEncoderEpoch) uplinkEncoderError = true;
+    },
   });
   enc.configure({
     codec: UPLINK_H264_CODEC,
@@ -2034,6 +2045,10 @@ async function send() {
     if (timer) clearInterval(timer);
     timer = null;
     stopVideoPull();
+    // Stop the old session's WebCodecs callbacks before its `start` control
+    // message enters the socket. setupUplinkEncoder() restores the monotonic
+    // frame timeline after the new server decoder is ready.
+    teardownUplinkEncoder(true);
     try { if (usingVideoFile) camera.pause(); } catch (err) {}
     const ok = await beginSession({ preserveContinuity: true });
     if (ok) return;

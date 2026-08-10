@@ -110,9 +110,12 @@ take several minutes at startup, then runs entirely on the selected logical
 keeps real scene cuts from being blended with prior causal state. The one-GPU
 backend sustained more than 30 FPS while preserving every complete temporal
 chunk; prompt changes retain that safe teardown while cancelling obsolete
-queued work and preserving buffered playback. Reference-image shapes are
-warmed at startup. The browser retains the upstream 24 FPS cap for operating
-headroom. See
+queued work and preserving buffered playback. Late browser WebCodecs callbacks
+are fenced at each prompt boundary, and unused allocator blocks are released
+after the synchronized teardown so repeated prompts neither corrupt the next
+H.264 session nor accumulate cached HBM. Model tensors remain on the same GPU.
+Reference-image shapes are warmed at startup. The browser retains the upstream
+24 FPS cap for operating headroom. See
 [`HANDOFF.md`](HANDOFF.md) for the exact TheRock setup, launch, benchmark, and
 rocprof commands.
 
